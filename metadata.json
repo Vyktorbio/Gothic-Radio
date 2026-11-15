@@ -1,0 +1,6 @@
+{
+  "name": "Rádio Drive FM — Suas Músicas do Google Drive",
+  "description": "Estação de rádio pessoal conectada à pasta Músicas do seu Google Drive, com reprodução contínua, filtro por artistas e modo aleatório.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
