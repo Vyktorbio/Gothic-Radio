@@ -6,6 +6,8 @@ import {VitePWA} from 'vite-plugin-pwa';
 
 export default defineConfig(() => {
   return {
+    // Relative URLs also work when the app is hosted below /Gothic-Radio/.
+    base: './',
     plugins: [
       react(),
       tailwindcss(),
@@ -13,30 +15,32 @@ export default defineConfig(() => {
         registerType: 'autoUpdate',
         includeAssets: ['apple-touch-icon.png', 'icon.svg'],
         manifest: {
-          id: '/',
-          name: 'Gothic Rádio — 80s Digital',
+          id: './',
+          name: 'Gothic Rádio',
           short_name: 'Gothic Rádio',
-          description: 'Gothic Rádio — Rádio digital anos 80 conectada à pasta Coleção do Google Drive.',
-          theme_color: '#070A0E',
-          background_color: '#070A0E',
+          description: 'Gothic Rádio. Aperte o play.',
+          theme_color: '#0b0b0b',
+          background_color: '#0b0b0b',
           display: 'standalone',
-          start_url: '/',
-          scope: '/',
+          start_url: './',
+          scope: './',
+          lang: 'pt-BR',
+          categories: ['music', 'entertainment'],
           icons: [
             {
-              src: '/pwa-192x192.png',
+              src: 'pwa-192x192.png',
               sizes: '192x192',
               type: 'image/png',
               purpose: 'any',
             },
             {
-              src: '/pwa-512x512.png',
+              src: 'pwa-512x512.png',
               sizes: '512x512',
               type: 'image/png',
               purpose: 'any',
             },
             {
-              src: '/pwa-maskable-512x512.png',
+              src: 'pwa-maskable-512x512.png',
               sizes: '512x512',
               type: 'image/png',
               purpose: 'maskable',
@@ -44,7 +48,7 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
-          globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
+          globPatterns: ['**/*.{js,css,html,ico,png,svg,jpg,woff,woff2}'],
           runtimeCaching: [
             {
               urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
@@ -77,7 +81,7 @@ export default defineConfig(() => {
           ],
         },
         devOptions: {
-          enabled: true,
+          enabled: false,
           type: 'module',
         },
       }),
