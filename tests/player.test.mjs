@@ -39,7 +39,7 @@ test('opens a saved catalog and last selection without a token or scan', async (
   assert.equal(app.nodes.get('track-title').textContent, sample[0].title);
   assert.equal(app.nodes.get('audio-player').volume, .4);
   assert.equal(app.run('accessToken'), null);
-  assert.equal(app.run('authPopup'), null);
+  assert.equal(app.run('pendingAuthPromise'), null);
   await app.run('restoreMusicMemory()');
   assert.equal(app.run('currentTrack.id'), 'test-1');
 });
@@ -79,17 +79,44 @@ test('a failed refresh preserves existing tracks', async () => {
   assert.equal(app.run('currentTrack.id'), sample[0].id);
 });
 
-test('OAuth bridge accepts only the opened window and its authorized origin', async () => {
+test('login uses the direct provider and saves its result without an external bridge', async () => {
   const app = boot();
-  app.run('void ensureValidToken(true)');
-  const origin = app.run('BRIDGE_ORIGIN');
-  const message = { type: 'GOTHIC_RADIO_OAUTH_TOKEN', accessToken: 'unit-test-token' };
-  app.events.get('message')({ origin: 'https://example.invalid', source: app.popup, data: message });
-  assert.equal(app.run('accessToken'), null);
-  app.events.get('message')({ origin, source: {}, data: message });
-  assert.equal(app.run('accessToken'), null);
-  app.events.get('message')({ origin, source: app.popup, data: message });
-  assert.equal(app.run('accessToken'), 'unit-test-token');
+  let calls = 0;
+  app.ctx.window.gothicRadioSignIn = async () => {
+    calls++;
+    return { accessToken: 'unit-test-token', email: 'test@example.invalid' };
+  };
+  const first = app.run('ensureValidToken(true)');
+  const second = app.run('ensureValidToken(true)');
+  assert.equal(await first, 'unit-test-token');
+  assert.equal(await second, 'unit-test-token');
+  assert.equal(calls, 1);
+  assert.equal(app.run('pendingAuthPromise'), null);
+  assert.equal(app.nodes.get('btn-connect').disabled, false);
+  assert.equal(app.values.get('gothic_radio_drive_token_v1'), 'unit-test-token');
+  assert.doesNotMatch(html, /ais-dev-|oauth_bridge|input-manual-token/);
+});
+
+test('unauthorized domain and cancelled logins settle and allow another attempt', async () => {
+  const app = boot();
+  for (const code of ['auth/unauthorized-domain', 'auth/popup-closed-by-user']) {
+    app.ctx.window.gothicRadioSignIn = async () => { throw { code }; };
+    assert.equal(await app.run('ensureValidToken(true)'), null);
+    assert.equal(app.run('pendingAuthPromise'), null);
+    assert.equal(app.nodes.get('btn-connect').disabled, false);
+    assert.equal(app.run('accessToken'), null);
+    if (code === 'auth/unauthorized-domain') {
+      assert.match(app.nodes.get('status-banner').textContent, /vyktorbio.github.io/);
+    }
+  }
+});
+
+test('playback without a fresh user gesture asks for a tap instead of opening a blocked popup', async () => {
+  const app = boot();
+  app.ctx.navigator.userActivation = { isActive: false };
+  app.ctx.window.gothicRadioSignIn = () => { throw Error('Must not open popup'); };
+  assert.equal(await app.run('ensureValidToken(true)'), null);
+  assert.match(app.nodes.get('status-banner').textContent, /Toque em Entrar/);
 });
 
 test('corrupt browser memory cannot prevent startup', async () => {

@@ -30,11 +30,6 @@
     </nav>
     <main>
       <div id="status-banner" role="status" aria-live="polite" class="hidden"></div>
-      <div id="token-paste-box" class="hidden login-code">
-        <div class="login-heading"><span>Conclua o login na janela aberta</span><button id="btn-close-paste" aria-label="Fechar código de login">×</button></div>
-        <label for="input-manual-token">Se a conexão não voltar automaticamente, cole o código de login aqui.</label>
-        <div class="login-input"><input id="input-manual-token" type="password" autocomplete="off" placeholder="Código de login" /><button id="btn-save-manual-token">Ativar</button></div>
-      </div>
       <section class="radio-deck" aria-label="Player da Gothic Rádio">
         <div class="radio-status"><span><i aria-hidden="true"></i><span id="play-state-label">Sem sinal</span></span><span id="mode-indicator">Sequência</span></div>
         <div class="radio-track"><h1 id="track-title">—</h1><p id="track-artist">Entre para ouvir</p></div>
@@ -61,8 +56,6 @@
       setItem(key, value) { try { localStorage.setItem(key, value); return true; } catch { return false; } },
       removeItem(key) { try { localStorage.removeItem(key); } catch {} },
     };
-    const BRIDGE_ORIGIN = "https://ais-dev-bniubybsvuzxxeptmo4gyt-552680945235.us-west2.run.app";
-    const FALLBACK_BRIDGE_ORIGIN = "https://ais-pre-bniubybsvuzxxeptmo4gyt-552680945235.us-west2.run.app";
     const COLECAO_FOLDER_ID = storage.getItem('radio_colecao_folder_id_v1') || '1lWs0LtOkqLMjOgX_zGRP9MmaDdMdxgnV';
     const AUDIO_EXT = /\.(mp3|mp4|wav|m4a|m4b|m4p|m4r|flac|ogg|oga|opus|aac|wma|aiff|aif|alac|ape|wv|mpc|tta|mp2|mpga|mpa|weba|webm|3gp|ac3|dts|amr|au|pcm|mid|midi)(\s*\(\d+\))?$/i;
     const NON_AUDIO_EXT = /\.(jpg|jpeg|png|gif|webp|pdf|txt|doc|docx|zip|rar|ini|db|srt|cue|log|m3u)(\s*\(\d+\))?$/i;
@@ -101,8 +94,7 @@
     let lastPositionSave = 0;
     isShuffle = savedPlayback.shuffle === true;
     let isPlaying = false;
-    let pendingAuthResolve = null;
-    let authPopup = null;
+    let pendingAuthPromise = null;
 
     const audio = document.getElementById('audio-player');
     const statusBanner = document.getElementById('status-banner');
@@ -200,24 +192,9 @@
         storage.setItem('gothic_radio_drive_token_v1', accessToken);
         storage.setItem('gothic_radio_drive_token_exp_v1', String(tokenExpiresAt));
       } catch (e) {}
-      document.getElementById('token-paste-box').classList.add('hidden');
       showStatus('');
       renderUI();
-      if (pendingAuthResolve) {
-        const r = pendingAuthResolve;
-        pendingAuthResolve = null;
-        r(accessToken);
-      }
     }
-
-    // Listen for OAuth Bridge message from the authorized popup window
-    window.addEventListener('message', (event) => {
-      if (![BRIDGE_ORIGIN, FALLBACK_BRIDGE_ORIGIN].includes(event.origin) || !authPopup || event.source !== authPopup) return;
-      const data = event.data;
-      if (data && data.type === 'GOTHIC_RADIO_OAUTH_TOKEN' && typeof data.accessToken === 'string') {
-        saveToken(data.accessToken, data.email || '', data.tracks);
-      }
-    });
 
     function fmtTime(sec) {
       if (!sec || !Number.isFinite(sec)) return '00:00';
@@ -243,14 +220,43 @@
     async function ensureValidToken(interactive = false) {
       if (accessToken && Date.now() < tokenExpiresAt - 60000) return accessToken;
       if (!interactive) return null;
-
-      return new Promise((resolve) => {
-        pendingAuthResolve = resolve;
-        const bridgeUrl = (BRIDGE_ORIGIN || FALLBACK_BRIDGE_ORIGIN) + '/?oauth_bridge=1';
-        showStatus('ABRINDO LOGIN...');
-        document.getElementById('token-paste-box').classList.remove('hidden');
-        authPopup = window.open(bridgeUrl, 'GothicRadioOAuthBridge', 'width=520,height=640,menubar=no,toolbar=no,location=no,status=no');
-      });
+      if (pendingAuthPromise) return pendingAuthPromise;
+      if (typeof window.gothicRadioSignIn !== 'function') {
+        showStatus('O login ainda está carregando. Aguarde e toque em Entrar novamente.');
+        return null;
+      }
+      // Downloads and cache reads may consume the click activation on iOS.
+      // Ask for a fresh tap instead of opening a popup that Safari will block.
+      if (navigator.userActivation && !navigator.userActivation.isActive) {
+        showStatus('Toque em Entrar para conectar sua conta e continuar ouvindo.');
+        return null;
+      }
+      showStatus('Conectando ao Google…');
+      const button = document.getElementById('btn-connect');
+      button.disabled = true;
+      pendingAuthPromise = (async () => {
+        try {
+          const result = await window.gothicRadioSignIn(savedEmail);
+          if (!result?.accessToken) throw new Error('missing-token');
+          saveToken(result.accessToken, result.email || '');
+          return accessToken;
+        } catch (error) {
+          const messages = {
+            'auth/unauthorized-domain': 'O domínio da rádio ainda não foi autorizado no Firebase. Adicione vyktorbio.github.io em Authentication → Settings → Authorized domains.',
+            'auth/popup-blocked': 'O navegador bloqueou o login. Abra a rádio no Safari ou Chrome e permita a janela de login.',
+            'auth/popup-closed-by-user': 'Login não concluído. Toque em Entrar para tentar novamente.',
+            'auth/cancelled-popup-request': 'Login interrompido. Toque em Entrar para tentar novamente.',
+            'auth/network-request-failed': 'Não foi possível conectar ao Google. Verifique sua conexão e tente novamente.',
+            'auth/operation-not-allowed': 'O login com Google precisa ser ativado nas configurações de autenticação da rádio.',
+          };
+          showStatus(messages[error?.code] || 'Não foi possível entrar. Tente novamente.');
+          return null;
+        } finally {
+          button.disabled = false;
+          pendingAuthPromise = null;
+        }
+      })();
+      return pendingAuthPromise;
     }
 
     async function driveListAll(q, fields) {
@@ -492,15 +498,6 @@
       const tok = await ensureValidToken(true);
       if (tok && tracks.length === 0) scanColecao(true);
       else renderUI();
-    };
-    document.getElementById('btn-close-paste').onclick = () => {
-      document.getElementById('token-paste-box').classList.add('hidden');
-      showStatus('');
-      if (pendingAuthResolve) { const resolve = pendingAuthResolve; pendingAuthResolve = null; resolve(null); }
-    };
-    document.getElementById('btn-save-manual-token').onclick = () => {
-      const val = document.getElementById('input-manual-token').value.trim();
-      if (val) saveToken(val, '');
     };
     document.getElementById('btn-rescan').onclick = () => scanColecao(true);
     document.getElementById('btn-open-menu').onclick = () => document.getElementById('drawer').classList.remove('hidden');
