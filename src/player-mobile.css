@@ -101,3 +101,21 @@ button:disabled { opacity: .5; cursor: default; }
   .radio-deck { padding: 16px; }
   .radio-up-next { grid-template-columns: 56px minmax(0, 1fr); gap: 8px; }
 }
+
+.station-controls { margin-top:20px; font-size:12px; display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.station-controls select { flex:1; min-width:140px; max-width:100%; background:#171716; color:#dddcd8; border:1px solid #49433f; padding:12px; font:inherit; }
+.station-controls p { width:100%; color:#92928e; font-size:11px; line-height:1.6; margin:4px 0; }
+.station-controls button { min-height:44px; padding:8px; }
+.station-controls details { width:100%; }
+.station-controls summary { cursor:pointer; padding:12px 0; }
+.track-with-menu { display:flex; align-items:center; gap:8px; }
+.track-with-menu button { min-width:44px; min-height:44px; }
+.track-with-menu > button:first-child { flex:1; min-width:0; text-align:left; overflow-wrap:anywhere; }
+#btn-station-current { min-width:44px; min-height:44px; font-size:24px; }
+#station-dialog { background:#141413; color:#dddcd8; border:1px solid #87433d; width:min(440px,calc(100% - 24px)); max-height:85dvh; padding:20px; overflow:auto; }
+#station-dialog::backdrop { background:#000b; }
+#station-dialog h2 { font-size:18px; }
+#station-dialog p { overflow-wrap:anywhere; font-size:12px; }
+#station-dialog label { display:flex; gap:12px; align-items:center; min-height:44px; overflow-wrap:anywhere; }
+#station-dialog input:not([type=checkbox]) { display:block; width:100%; background:#0b0b0b; color:inherit; border:1px solid #555; padding:12px; margin-top:12px; }
+#station-dialog button { min-height:44px; padding:10px; border:1px solid #45423c; margin:8px 8px 0 0; }

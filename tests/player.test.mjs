@@ -12,9 +12,10 @@ function boot({ db = new IDBFactory(), values = new Map(), full = false, navigat
   const nodes = new Map();
   function element() {
     return { textContent: '', value: '', src: '', currentTime: 0, duration: 180, children: [],
+      set innerHTML(value) { this.children = []; }, get innerHTML() { return ''; },
       classList: { add() {}, remove() {}, toggle() {} }, setAttribute() {},
       append(...children) { this.children.push(...children); }, appendChild(child) { this.children.push(child); },
-      paused: true, playbackRate: 1, async play() { this.paused = false; this.onplay?.(); }, pause() { this.paused = true; this.onpause?.(); },
+      paused: true, playbackRate: 1, async play() { this.paused = false; this.onplay?.(); this.onplaying?.(); }, pause() { this.paused = true; this.onpause?.(); },
     };
   }
   const document = { baseURI: 'https://vyktorbio.github.io/Gothic-Radio/', body: element(), querySelector: () => null, createElement: element,
@@ -24,7 +25,7 @@ function boot({ db = new IDBFactory(), values = new Map(), full = false, navigat
     setItem(k, v) { if (full) throw Error('QuotaExceededError'); values.set(k, v); } };
   const window = { indexedDB: db, addEventListener: (name, fn) => events.set(name, fn), open: () => popup };
   const ctx = vm.createContext({ window, document, localStorage, indexedDB: db, navigator, MediaMetadata: class { constructor(data) { Object.assign(this, data); } }, console,
-    setTimeout, clearTimeout, fetch, URL, Response, Blob, structuredClone });
+    setTimeout, clearTimeout, fetch, URL, Response, Blob, structuredClone, AbortController, TextDecoder, crypto: { randomUUID: () => 'station-' + Math.random() } });
   vm.runInContext(script, ctx);
   return { ctx, db, values, nodes, events, popup, run: code => vm.runInContext(code, ctx) };
 }
@@ -219,4 +220,172 @@ test('one unsupported media action cannot disable the other lock screen controls
   assert.ok(registered.includes('nexttrack'));
   assert.ok(registered.includes('previoustrack'));
   assert.ok(registered.includes('seekforward'));
+});
+
+
+test('stations persist, deduplicate membership and do not mutate active queue', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  app.run("createStation('Noite'); setStationMembership(personal.stations[0].id, 'a', true); setStationMembership(personal.stations[0].id, 'a', true)");
+  assert.equal(app.run('personal.stations[0].ids.length'), 1);
+  app.run("selectStation('personal:' + personal.stations[0].id)");
+  assert.equal(app.run('getQueue().length'), 1);
+  app.run("setStationMembership(personal.stations[0].id, 'b', true)");
+  assert.equal(app.run('getQueue().length'), 1);
+  app.run("selectStation('personal:' + personal.stations[0].id)");
+  assert.equal(app.run('getQueue().length'), 2);
+  app.run("setStationMembership(personal.stations[0].id, 'a', false)");
+  await app.run('personalWrites');
+  const reopened = boot({ db: app.db, values: app.values });
+  await reopened.run('musicReady');
+  assert.equal(reopened.run('personal.stations[0].name'), 'Noite');
+  assert.equal(reopened.run('personal.stations[0].ids.join()'), 'b');
+});
+
+test('history records actual playback once per request, survives reload, is capped', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  await app.run('playTrack(tracks[0])');
+  assert.equal(app.run('personal.history.length'), 1);
+  app.run('audio.pause()');
+  await app.run('resumePlayback()');
+  assert.equal(app.run('personal.history.length'), 1);
+  await app.run('nextTrack()');
+  assert.equal(app.run('personal.history[0].id'), 'b');
+  app.run('for (let i=0;i<205;i++) { playbackRequest++; audio.onplaying(); }');
+  assert.equal(app.run('personal.history.length'), 200);
+  await app.run('personalWrites');
+  const reopened = boot({ db: app.db, values: app.values });
+  await reopened.run('musicReady');
+  assert.equal(reopened.run('personal.history.length'), 200);
+});
+
+test('failed audio does not enter history or open background login', async () => {
+  const app = playerFixture({}, async () => { throw Error('offline'); });
+  await app.run('musicReady');
+  await app.run('playTrack(tracks[0])');
+  assert.equal(app.run('personal.history.length'), 0);
+  app.ctx.window.gothicRadioSignIn = () => { throw Error('Unexpected popup'); };
+  app.run('accessToken = null; prepareNext(tracks[1])');
+  assert.equal(app.run('prefetchJob'), null);
+});
+
+test('prefetch is exactly announced next and reused while pending', async () => {
+  const requests = [];
+  let release;
+  const app = playerFixture({}, async (url, options) => {
+    requests.push({ url, signal: options.signal });
+    if (url.includes('/b?')) await new Promise(resolve => { release = resolve; });
+    return new Response(new Blob(['audio']));
+  });
+  await app.run('musicReady');
+  await app.run('playTrack(tracks[0])');
+  assert.equal(app.run('prefetchJob.id'), 'b');
+  const pending = app.run('nextTrack()');
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(requests.filter(r => r.url.includes('/b?')).length, 1);
+  release();
+  await pending;
+  assert.equal(app.run('loadedTrackId'), 'b');
+});
+
+test('queue changes cancel obsolete prefetch and preserve current audio', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  await app.run('playTrack(tracks[0])');
+  const job = app.run('prefetchJob');
+  app.run("selectedArtist = 'Three'; renderUI()");
+  assert.equal(job.controller.signal.aborted, true);
+  assert.equal(app.run('prefetchJob.id'), 'c');
+  assert.equal(app.run('loadedTrackId'), 'a');
+});
+
+test('account switch isolates personal data and can restore old account', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  app.run("createStation('Private')");
+  await app.run('personalWrites');
+  // Avoid published catalog fetch in this isolation unit; tested separately above.
+  app.run('loadPublishedCatalog = async () => {}');
+  await app.run("changePersonalAccount('other@example.invalid')");
+  assert.equal(app.run('personal.stations.length'), 0);
+  assert.equal(app.run('favIds.size'), 0);
+  assert.equal(app.run('tracks.length'), 0);
+  await app.run("changePersonalAccount('')");
+  assert.equal(app.run('personal.stations[0].name'), 'Private');
+});
+
+test('genre normalization uses tags only and partial parser rejects unsupported bytes', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  assert.equal(app.run("normalizeGenres(['Post Punk', 'post-punk', 'EBM']).join('|')"), 'post-punk|ebm');
+  assert.equal(app.run('parsePartialGenres(new Uint8Array([1,2,3])).status'), 'unsupported');
+  app.run("personal.genres.a = { values: ['ebm'], status: 'tagged' }; selectStation('genre:ebm')");
+  assert.equal(app.run('getQueue().map(t => t.id).join()'), 'a');
+  app.run("selectStation('all')");
+  assert.equal(app.run('getQueue().length'), 3);
+});
+
+test('genre indexing refuses full responses and preserves retryability', async () => {
+  const app = playerFixture({}, async () => new Response(new Blob(['not partial']), { status: 200 }));
+  await app.run('musicReady');
+  await app.run('indexGenres()');
+  assert.equal(app.run('Object.keys(personal.genres).length'), 0);
+  assert.equal(app.run('genreRunning'), false);
+});
+
+test('ID3v2.3 text genre is decoded from a bounded frame', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  app.ctx.tag = new Uint8Array([73,68,51,3,0,0,0,0,0,14,84,67,79,78,0,0,0,4,0,0,3,69,66,77]);
+  assert.equal(app.run("parsePartialGenres(tag).values.join()"), 'ebm');
+});
+
+
+test('renaming and guarded deletion preserve all tracks and favorites', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  app.run("createStation('Old'); toggleFavorite(tracks[0]); selectStation('personal:' + personal.stations[0].id)");
+  assert.equal(app.run("renameStation(personal.stations[0].id, 'New')"), true);
+  assert.equal(app.run('personal.stations[0].name'), 'New');
+  assert.equal(app.run("deleteStation(personal.stations[0].id)"), false);
+  assert.equal(app.run('personal.stations.length'), 1);
+  assert.equal(app.run("deleteStation(personal.stations[0].id, true)"), true);
+  assert.equal(app.run('personal.stations.length'), 0);
+  assert.equal(app.run('getQueue().length'), 3);
+  assert.equal(app.run("favIds.has('a')"), true);
+  await app.run('personalWrites');
+});
+
+test('prefetch failure cannot pause the current song and a next tap retries', async () => {
+  let failed = false;
+  const app = playerFixture({}, async url => {
+    if (url.includes('/b?') && !failed) { failed = true; throw Error('offline'); }
+    return new Response(new Blob(['audio']));
+  });
+  await app.run('musicReady');
+  await app.run('playTrack(tracks[0])');
+  await app.run('prefetchJob.promise.catch(() => {})');
+  assert.equal(app.run('isPlaying'), true);
+  assert.equal(app.run('loadedTrackId'), 'a');
+  await app.run('nextTrack()');
+  assert.equal(app.run('loadedTrackId'), 'b');
+});
+
+test('save-data disables speculative transfers', async () => {
+  const app = playerFixture({ connection: { saveData: true } });
+  await app.run('musicReady');
+  await app.run('playTrack(tracks[0])');
+  assert.equal(app.run('prefetchJob'), null);
+});
+
+test('legacy unscoped IndexedDB catalog survives migration', async () => {
+  const db = new IDBFactory();
+  const app = boot({ db });
+  await app.run('musicReady');
+  app.ctx.legacyTracks = sample;
+  await app.run("personalTransaction('readwrite', store => store.put({ tracks: legacyTracks, meta: { folderId: COLECAO_FOLDER_ID } }, 'gothic_radio_snapshot_v4'))");
+  const reopened = boot({ db });
+  await reopened.run('musicReady');
+  assert.equal(reopened.run('tracks[0].id'), 'test-1');
 });
