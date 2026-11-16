@@ -1021,6 +1021,7 @@
     }
 
     async function resumePlayback() {
+      if (onlyUnheard && audio.ended) return nextTrack();
       if (!audio.src || loadedTrackId !== currentTrack?.id) return playTrack((!onlyUnheard || (currentTrack && !heardIds.has(currentTrack.id))) ? (currentTrack || getQueue()[0]) : getQueue()[0]);
       try { await audio.play(); } catch { showStatus('Toque em Play na rádio para continuar.'); }
     }
@@ -1193,7 +1194,7 @@
       document.getElementById('vol-label').textContent = audio.muted ? 'MUTE' : Math.round(audio.volume * 100) + '%';
     };
     document.getElementById('search-input').oninput = (e) => { searchQuery = e.target.value.toLowerCase(); visibleTrackLimit = 100; renderUI(); };
-    audio.onended = nextTrack;
+    audio.onended = () => { isPlaying = false; updateMediaPosition(); renderUI(); return nextTrack(); };
     audio.onseeked = updateMediaPosition;
     audio.onratechange = updateMediaPosition;
     setupMediaSession();
