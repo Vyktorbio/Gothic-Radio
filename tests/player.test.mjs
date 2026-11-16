@@ -340,3 +340,52 @@ test('ID3v2.3 text genre is decoded from a bounded frame', async () => {
   app.ctx.tag = new Uint8Array([73,68,51,3,0,0,0,0,0,14,84,67,79,78,0,0,0,4,0,0,3,69,66,77]);
   assert.equal(app.run("parsePartialGenres(tag).values.join()"), 'ebm');
 });
+
+
+test('renaming and guarded deletion preserve all tracks and favorites', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  app.run("createStation('Old'); toggleFavorite(tracks[0]); selectStation('personal:' + personal.stations[0].id)");
+  assert.equal(app.run("renameStation(personal.stations[0].id, 'New')"), true);
+  assert.equal(app.run('personal.stations[0].name'), 'New');
+  assert.equal(app.run("deleteStation(personal.stations[0].id)"), false);
+  assert.equal(app.run('personal.stations.length'), 1);
+  assert.equal(app.run("deleteStation(personal.stations[0].id, true)"), true);
+  assert.equal(app.run('personal.stations.length'), 0);
+  assert.equal(app.run('getQueue().length'), 3);
+  assert.equal(app.run("favIds.has('a')"), true);
+  await app.run('personalWrites');
+});
+
+test('prefetch failure cannot pause the current song and a next tap retries', async () => {
+  let failed = false;
+  const app = playerFixture({}, async url => {
+    if (url.includes('/b?') && !failed) { failed = true; throw Error('offline'); }
+    return new Response(new Blob(['audio']));
+  });
+  await app.run('musicReady');
+  await app.run('playTrack(tracks[0])');
+  await app.run('prefetchJob.promise.catch(() => {})');
+  assert.equal(app.run('isPlaying'), true);
+  assert.equal(app.run('loadedTrackId'), 'a');
+  await app.run('nextTrack()');
+  assert.equal(app.run('loadedTrackId'), 'b');
+});
+
+test('save-data disables speculative transfers', async () => {
+  const app = playerFixture({ connection: { saveData: true } });
+  await app.run('musicReady');
+  await app.run('playTrack(tracks[0])');
+  assert.equal(app.run('prefetchJob'), null);
+});
+
+test('legacy unscoped IndexedDB catalog survives migration', async () => {
+  const db = new IDBFactory();
+  const app = boot({ db });
+  await app.run('musicReady');
+  app.ctx.legacyTracks = sample;
+  await app.run("personalTransaction('readwrite', store => store.put({ tracks: legacyTracks, meta: { folderId: COLECAO_FOLDER_ID } }, 'gothic_radio_snapshot_v4'))");
+  const reopened = boot({ db });
+  await reopened.run('musicReady');
+  assert.equal(reopened.run('tracks[0].id'), 'test-1');
+});
