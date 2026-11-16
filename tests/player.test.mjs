@@ -12,6 +12,7 @@ function boot({ db = new IDBFactory(), values = new Map(), full = false, navigat
   const nodes = new Map();
   function element() {
     return { textContent: '', value: '', src: '', currentTime: 0, duration: 180, children: [],
+      set innerHTML(value) { this.children = []; }, get innerHTML() { return ''; },
       classList: { add() {}, remove() {}, toggle() {} }, setAttribute() {},
       append(...children) { this.children.push(...children); }, appendChild(child) { this.children.push(child); },
       paused: true, playbackRate: 1, async play() { this.paused = false; this.onplay?.(); this.onplaying?.(); }, pause() { this.paused = true; this.onpause?.(); },
