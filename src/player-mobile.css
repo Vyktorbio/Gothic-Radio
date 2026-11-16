@@ -119,3 +119,17 @@ button:disabled { opacity: .5; cursor: default; }
 #station-dialog label { display:flex; gap:12px; align-items:center; min-height:44px; overflow-wrap:anywhere; }
 #station-dialog input:not([type=checkbox]) { display:block; width:100%; background:#0b0b0b; color:inherit; border:1px solid #555; padding:12px; margin-top:12px; }
 #station-dialog button { min-height:44px; padding:10px; border:1px solid #45423c; margin:8px 8px 0 0; }
+
+#btn-settings { color:#92928e; min-width:44px; font-size:20px; }
+.discovery-controls { width:100%; border-top:1px solid #30302e; padding-top:8px; }
+#btn-unheard { padding-left:0; color:#999a94; text-align:left; }
+#btn-unheard[aria-pressed=true] { color:#e48178; }
+#settings-dialog { background:#141413; color:#dddcd8; border:1px solid #57433f; width:min(440px,calc(100% - 24px)); max-height:85dvh; padding:20px; overflow:auto; }
+#settings-dialog::backdrop { background:#000b; }
+#settings-dialog h2 { font-size:18px; }
+#settings-dialog h3 { font-size:14px; margin-top:24px; }
+#settings-dialog p { color:#aaa99f; font-size:12px; line-height:1.6; overflow-wrap:anywhere; }
+#settings-dialog button, .backup-file { min-height:44px; padding:12px; border:1px solid #45423c; display:inline-block; margin:6px 6px 6px 0; font-size:12px; }
+.backup-file input { display:block; max-width:100%; margin-top:12px; font:inherit; }
+#settings-dialog details { margin-top:24px; font-size:12px; }
+#settings-dialog summary { min-height:44px; cursor:pointer; }
