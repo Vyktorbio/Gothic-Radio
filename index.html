@@ -316,6 +316,19 @@
         if (!personal.history.length) node('p', 'Nenhuma faixa tocada neste aparelho.', list);
       }
     }
+    function renameStation(id, name) {
+      const station = personal.stations.find(s => s.id === id);
+      if (!personalReady || !station || !String(name).trim()) return false;
+      station.name = String(name).trim().slice(0, 80);
+      void persistPersonal(); return true;
+    }
+    function deleteStation(id, confirmed = false) {
+      if (!personalReady || !confirmed) return false;
+      personal.stations = personal.stations.filter(s => s.id !== id);
+      void persistPersonal();
+      if (selectedStation === 'personal:' + id) selectStation('all');
+      return true;
+    }
     function manageStation() {
       const station = personal.stations.find(s => 'personal:' + s.id === selectedStation);
       if (!station) return;
@@ -325,12 +338,11 @@
       input.setAttribute('aria-label', 'Nome da estação');
       action('Renomear', () => {
         if (!input.value.trim()) return;
-        station.name = input.value.trim(); void persistPersonal(); renderUI(); dialog.close();
+        renameStation(station.id, input.value); renderUI(); dialog.close();
       }, dialog);
       action('Excluir estação…', () => {
         if (!confirm('Excluir “' + station.name + '”? Somente esta seleção será removida; as músicas serão mantidas.')) return;
-        personal.stations = personal.stations.filter(s => s.id !== station.id);
-        void persistPersonal(); selectStation('all'); dialog.close();
+        deleteStation(station.id, true); dialog.close();
       }, dialog);
       action('Fechar', () => dialog.close(), dialog); dialog.showModal();
     }
