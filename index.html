@@ -35,7 +35,8 @@
         <div class="radio-track"><h1 id="track-title">—</h1><p id="track-artist">Entre para ouvir</p></div>
         <div class="radio-track-meta"><span id="station-sub">GOTHIC / 0 faixas</span><button id="btn-fav-current">Favoritar</button></div>
         <div class="radio-seek"><label class="sr-only" for="seek-slider">Posição da música</label><input id="seek-slider" type="range" min="0" max="100" step="0.5" value="0" /><div><span id="time-current">00:00</span><span id="time-total">00:00</span></div></div>
-        <div class="radio-transport"><button id="btn-prev" aria-label="Faixa anterior">←</button><button id="btn-play">Play</button><button id="btn-next" aria-label="Próxima faixa">→</button></div>
+        <div class="radio-transport"><button id="btn-prev" aria-label="Faixa anterior"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5v14M19 5 8 12l11 7Z"/></svg></button><button id="btn-play">Play</button><button id="btn-next" aria-label="Próxima faixa"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 5v14M5 5l11 7-11 7Z"/></svg></button></div>
+        <div class="radio-up-next" aria-live="polite"><span class="next-label">A seguir</span><div><p id="next-track-title">—</p><p id="next-track-artist">Escolha uma faixa</p></div></div>
         <div class="radio-options"><button id="btn-shuffle" aria-pressed="false">Aleatório</button><button id="btn-only-favs" aria-pressed="false">Só favoritas</button></div>
         <div class="radio-volume"><button id="btn-mute" aria-label="Silenciar ou ativar som">Vol.</button><label class="sr-only" for="vol-slider">Volume</label><input id="vol-slider" type="range" min="0" max="1" step="0.01" value="0.85" /><span id="vol-label">85%</span></div>
       </section>
@@ -95,6 +96,10 @@
     isShuffle = savedPlayback.shuffle === true;
     let isPlaying = false;
     let pendingAuthPromise = null;
+    let nextPlan = null;
+    let playbackHistory = [];
+    let playbackRequest = 0;
+    let loadedTrackId = null;
 
     const audio = document.getElementById('audio-player');
     const statusBanner = document.getElementById('status-banner');
@@ -165,13 +170,14 @@
       storage.setItem('gothic_radio_playback_v1', JSON.stringify(savedPlayback));
     }
     window.addEventListener('pagehide', rememberPlayback);
-    audio.onpause = () => { isPlaying = false; rememberPlayback(); renderUI(); };
-    audio.onplay = () => { isPlaying = true; renderUI(); };
+    audio.onpause = () => { isPlaying = false; rememberPlayback(); updateMediaPosition(); renderUI(); };
+    audio.onplay = () => { isPlaying = true; setupMediaSession(); renderUI(); };
     audio.onloadedmetadata = () => {
       if (restoreTrackTime && currentTrack?.id === savedPlayback.trackId && Number.isFinite(audio.duration)) {
         audio.currentTime = Math.max(0, Math.min(savedPlayback.time || 0, audio.duration));
       }
       restoreTrackTime = false;
+      updateMediaPosition();
     };
 
     function saveToken(tok, email, incomingTracks) {
@@ -360,8 +366,14 @@
       });
     }
 
-    async function playTrack(track) {
+    async function playTrack(track, rememberHistory = true) {
       if (!track) return;
+      const request = ++playbackRequest;
+      if (rememberHistory && currentTrack && currentTrack.id !== track.id) {
+        playbackHistory.push(currentTrack.id);
+        if (playbackHistory.length > 200) playbackHistory.shift();
+      }
+      audio.pause();
       restoreTrackTime = track.id === savedPlayback.trackId;
       currentTrack = track;
       renderUI();
@@ -396,57 +408,125 @@
           blob = await res.blob();
           if (cache) await cache.put(cacheKey, new Response(blob));
         }
+        if (request !== playbackRequest) return;
+        loadedTrackId = track.id;
         if (audio.src.startsWith('blob:')) URL.revokeObjectURL(audio.src);
         audio.src = URL.createObjectURL(blob);
         await audio.play();
+        if (request !== playbackRequest) return;
         isPlaying = true;
         showStatus('');
-        if ('mediaSession' in navigator) {
-          navigator.mediaSession.metadata = new MediaMetadata({ title: track.title, artist: track.artist, album: 'Gothic Rádio' });
-        }
+        setupMediaSession();
         renderUI();
       } catch (e) {
+        if (request !== playbackRequest) return;
         isPlaying = false;
         showStatus('ENTRE PARA CONTINUAR OUVINDO');
         renderUI();
       }
     }
 
-    function nextTrack() {
-      const q = getQueue();
-      if (!q.length) return;
-      if (isShuffle) {
-        playTrack(q[Math.floor(Math.random() * q.length)]);
-      } else {
-        const idx = q.findIndex(t => t.id === currentTrack?.id);
-        playTrack(q[(idx + 1) % q.length]);
+    function getNextTrack(q = getQueue()) {
+      if (!q.length) { nextPlan = null; return null; }
+      const key = JSON.stringify([currentTrack?.id, isShuffle, onlyFavs, selectedArtist, searchQuery, memoryRevision, q.length]);
+      if (nextPlan?.key === key) {
+        const planned = q.find(t => t.id === nextPlan.id);
+        if (planned) return planned;
       }
+      const index = q.findIndex(t => t.id === currentTrack?.id);
+      let next;
+      if (isShuffle && q.length > 1) {
+        const choices = q.filter(t => t.id !== currentTrack?.id);
+        next = choices[Math.floor(Math.random() * choices.length)];
+      } else next = q[(index + 1) % q.length];
+      nextPlan = { key, id: next.id };
+      return next;
+    }
+
+    function nextTrack() {
+      const next = getNextTrack();
+      if (next) return playTrack(next);
     }
 
     function prevTrack() {
-      if (audio.currentTime > 4) {
+      if (audio.currentTime > 4 && loadedTrackId === currentTrack?.id) {
         audio.currentTime = 0;
+        updateMediaPosition();
         return;
       }
       const q = getQueue();
       if (!q.length) return;
+      while (playbackHistory.length) {
+        const id = playbackHistory.pop();
+        const previous = q.find(t => t.id === id);
+        if (previous) return playTrack(previous, false);
+      }
       const idx = q.findIndex(t => t.id === currentTrack?.id);
-      playTrack(q[(idx - 1 + q.length) % q.length]);
+      return playTrack(q[(idx - 1 + q.length) % q.length], false);
+    }
+
+    async function resumePlayback() {
+      if (!audio.src || loadedTrackId !== currentTrack?.id) return playTrack(currentTrack || tracks[0]);
+      try { await audio.play(); } catch { showStatus('Toque em Play na rádio para continuar.'); }
+    }
+
+    function updateMediaPosition() {
+      if (!navigator.mediaSession) return;
+      try {
+        navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+        if (loadedTrackId !== currentTrack?.id || !Number.isFinite(audio.duration) || audio.duration <= 0) {
+          navigator.mediaSession.setPositionState?.();
+          return;
+        }
+        navigator.mediaSession.setPositionState?.({
+          duration: audio.duration, playbackRate: audio.playbackRate || 1,
+          position: Math.max(0, Math.min(audio.currentTime || 0, audio.duration)),
+        });
+      } catch {} // Media Session support varies between browsers.
+    }
+
+    function setupMediaSession() {
+      const session = navigator.mediaSession;
+      if (!session) return;
+      if (currentTrack && loadedTrackId === currentTrack.id && typeof MediaMetadata !== 'undefined') {
+        try {
+          session.metadata = new MediaMetadata({ title: currentTrack.title, artist: currentTrack.artist, album: 'Gothic Rádio',
+            artwork: [{ src: new URL('./pwa-512x512.png', document.baseURI).href, sizes: '512x512', type: 'image/png' }] });
+        } catch {}
+      }
+      const handlers = {
+        play: resumePlayback, pause: () => audio.pause(),
+        nexttrack: nextTrack, previoustrack: prevTrack,
+        seekto: details => {
+          if (Number.isFinite(details.seekTime) && Number.isFinite(audio.duration) && audio.duration > 0) {
+            audio.currentTime = Math.max(0, Math.min(details.seekTime, audio.duration));
+            updateMediaPosition();
+          }
+        },
+        seekbackward: null, seekforward: null,
+      };
+      for (const [action, handler] of Object.entries(handlers)) {
+        try { session.setActionHandler(action, handler); } catch {}
+      }
+      updateMediaPosition();
     }
 
     function renderUI() {
       const q = getQueue();
+      const upcoming = getNextTrack(q);
+      document.getElementById('next-track-title').textContent = upcoming?.title || 'Nenhuma faixa na fila';
+      document.getElementById('next-track-artist').textContent = upcoming?.artist || 'Escolha músicas ou ajuste os filtros';
       document.body.classList.toggle('is-playing', isPlaying);
       document.getElementById('btn-shuffle').setAttribute('aria-pressed', String(isShuffle));
       document.getElementById('btn-only-favs').setAttribute('aria-pressed', String(onlyFavs));
       document.getElementById('count-total').textContent = tracks.length;
       document.getElementById('count-favs').textContent = favIds.size;
       document.getElementById('drawer-count').textContent = q.length;
-      document.getElementById('station-sub').textContent = '' + (onlyFavs ? 'Favoritas' : selectedArtist === 'ALL' ? 'GOTHIC' : selectedArtist.toUpperCase()) + ' / ' + q.length + ' faixas';
+      document.getElementById('station-sub').textContent = (onlyFavs ? 'Favoritas' : selectedArtist === 'ALL' ? 'Todas as músicas' : selectedArtist) + ' · ' + q.length.toLocaleString('pt-BR') + ' faixas';
       document.getElementById('mode-indicator').textContent = isShuffle ? 'Aleatório' : 'Sequência';
       document.getElementById('play-state-label').textContent = isPlaying ? 'Tocando' : (tracks.length ? 'Parado' : 'Sem sinal');
       document.getElementById('track-title').textContent = currentTrack ? currentTrack.title : (tracks.length ? 'Escolha uma faixa' : '—');
-      document.getElementById('track-artist').textContent = currentTrack ? currentTrack.artist.toUpperCase() : 'Entre para ouvir';
+      document.getElementById('track-artist').textContent = currentTrack ? currentTrack.artist : 'Entre para ouvir';
       document.getElementById('btn-play').textContent = isPlaying ? 'Pausar' : 'Play';
       const isFav = currentTrack && favIds.has(currentTrack.id);
       document.getElementById('btn-fav-current').textContent = isFav ? 'Favorita' : 'Favoritar';
@@ -504,7 +584,7 @@
     document.getElementById('btn-search-top').onclick = () => document.getElementById('drawer').classList.remove('hidden');
     document.getElementById('btn-close-drawer').onclick = () => document.getElementById('drawer').classList.add('hidden');
     document.getElementById('btn-top-favs').onclick = () => { onlyFavs = !onlyFavs; renderUI(); };
-    document.getElementById('btn-play').onclick = () => { if (!audio.src) playTrack(currentTrack || tracks[0]); else if (audio.paused) { audio.play(); isPlaying = true; renderUI(); } else { audio.pause(); isPlaying = false; renderUI(); } };
+    document.getElementById('btn-play').onclick = () => { if (audio.paused || !audio.src) void resumePlayback(); else audio.pause(); };
     document.getElementById('btn-next').onclick = nextTrack;
     document.getElementById('btn-prev').onclick = prevTrack;
     document.getElementById('btn-shuffle').onclick = () => { isShuffle = !isShuffle; renderUI(); };
@@ -529,7 +609,11 @@
     };
     document.getElementById('search-input').oninput = (e) => { searchQuery = e.target.value.toLowerCase(); visibleTrackLimit = 100; renderUI(); };
     audio.onended = nextTrack;
+    audio.onseeked = updateMediaPosition;
+    audio.onratechange = updateMediaPosition;
+    setupMediaSession();
     audio.ontimeupdate = () => {
+      updateMediaPosition();
       if (Date.now() - lastPositionSave > 5000) { rememberPlayback(); lastPositionSave = Date.now(); }
       document.getElementById('seek-slider').value = audio.currentTime || 0;
       document.getElementById('seek-slider').max = audio.duration || 100;
