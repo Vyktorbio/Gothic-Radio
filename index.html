@@ -188,6 +188,7 @@
       selectedStation = 'all'; stationQueueIds = null; historyView = false; nextPlan = null;
       onlyFavs = false; selectedArtist = 'ALL'; searchQuery = '';
       // Flush the old account before changing ownership; never migrate its data to another account.
+      if (!personalReady) await personalLoaded;
       if (personalReady) await persistPersonal().catch(() => {});
       ++personalEpoch;
       personalOwner = owner;
@@ -386,7 +387,7 @@
       try { return await job.promise; }
       catch (error) {
         // A speculative failure can be retried by the foreground request, never by background login.
-        if (!job.background || job.controller.signal.aborted || job.owner !== personalOwner) throw error;
+        if (!job.background || activeDownload !== job || job.owner !== personalOwner) throw error;
         const retry = makeAudioJob(track, false); activeDownload = retry;
         return await retry.promise;
       } finally { if (activeDownload === job) activeDownload = null; }
@@ -533,8 +534,14 @@
         db = await openMusicMemory();
         const saved = await new Promise((resolve, reject) => {
           const tx = db.transaction('folder_memory', 'readonly');
-          const request = tx.objectStore('folder_memory').get('gothic_radio_snapshot_v4:' + personalOwner);
-          request.onsuccess = () => resolve(request.result);
+          const store = tx.objectStore('folder_memory');
+          const request = store.get('gothic_radio_snapshot_v4:' + personalOwner);
+          request.onsuccess = () => {
+            if (request.result || personalOwner !== legacyOwner.toLowerCase()) return resolve(request.result);
+            const legacy = store.get('gothic_radio_snapshot_v4');
+            legacy.onsuccess = () => resolve(legacy.result);
+            legacy.onerror = () => reject(legacy.error);
+          };
           request.onerror = () => reject(request.error);
         });
         if (revision !== memoryRevision || !Array.isArray(saved?.tracks) || saved.meta?.folderId !== COLECAO_FOLDER_ID) return;
@@ -677,6 +684,7 @@
       }
       const tok = await ensureValidToken(true);
       if (!tok) return;
+      const scanOwner = personalOwner;
       showStatus('Atualizando músicas…');
       try {
         const artistByFolderId = new Map();
@@ -730,6 +738,7 @@
           parsed.push({ id: f.id, streamFileId: eid, name: f.name, title, artist, sourceFolder: 'Coleção', mimeType: emime, sizeBytes: Number(f.size || 0) });
         }
 
+        if (scanOwner !== personalOwner) return;
         memoryRevision++;
         tracks = parsed;
         currentTrack = tracks.find(t => t.id === currentTrack?.id) || tracks[0] || null;
