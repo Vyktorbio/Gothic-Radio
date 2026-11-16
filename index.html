@@ -133,6 +133,7 @@
     let stationQueueIds = null;
     let prefetchJob = null, activeDownload = null, genreController = null;
     let genreRunning = false;
+    let genreRevision = 0, genreSummary = null;
     const PREFETCH_LIMIT = 32 * 1024 * 1024;
     const personalKey = () => 'personal-v1:' + personalOwner;
     async function personalTransaction(mode, action) {
@@ -282,15 +283,18 @@
       option(selector, 'favorites', 'Favoritas');
       const manual = node('optgroup', undefined, selector); manual.label = 'Minhas estações';
       personal.stations.forEach(s => option(manual, 'personal:' + s.id, s.name));
-      const genres = new Set();
-      let checked = 0, tagged = 0;
-      for (const track of tracks) {
+      const summaryKey = [memoryRevision, personalEpoch, genreRevision, tracks.length].join(':');
+      const genres = genreSummary?.key === summaryKey ? genreSummary.genres : new Set();
+      let checked = genreSummary?.key === summaryKey ? genreSummary.checked : 0;
+      let tagged = genreSummary?.key === summaryKey ? genreSummary.tagged : 0;
+      if (genreSummary?.key !== summaryKey) for (const track of tracks) {
         const entry = personal.genres[track.id];
         const values = entry?.values || normalizeGenres(track.genres || track.genre || []);
         if (entry || values.length) checked++;
         if (values.length) tagged++;
         values.forEach(g => genres.add(g));
       }
+      genreSummary = { key: summaryKey, genres, checked, tagged };
       const automatic = node('optgroup', undefined, selector); automatic.label = 'Por gênero';
       [...genres].sort().forEach(g => option(automatic, 'genre:' + g, g));
       selector.value = selectedStation;
@@ -458,7 +462,7 @@
       return { values: normalized, status: normalized.length ? 'tagged' : status };
     }
     async function indexGenres() {
-      if (genreRunning) { genreController?.abort(); genreRunning = false; renderUI(); return; }
+      if (genreRunning) { genreController?.abort(); genreController = null; genreRunning = false; renderUI(); return; }
       if (!personalReady) return;
       const tok = await ensureValidToken(false);
       if (!tok) { showStatus('Toque em Entrar antes de ler gêneros.'); return; }
@@ -480,6 +484,7 @@
           const result = parsePartialGenres(new Uint8Array(await blob.arrayBuffer()));
           if (controller.signal.aborted || epoch !== personalEpoch) break;
           personal.genres[track.id] = result;
+          genreRevision++;
           await persistPersonal();
           renderUI();
           await new Promise(resolve => setTimeout(resolve, 500));
@@ -487,7 +492,7 @@
       } catch {
         if (!controller.signal.aborted) showStatus('Leitura de gêneros pausada. Verifique o acesso ou tente mais tarde; o progresso foi mantido.');
       } finally {
-        if (epoch === personalEpoch) { genreRunning = false; renderUI(); }
+        if (epoch === personalEpoch && genreController === controller) { genreRunning = false; renderUI(); }
       }
     }
 
