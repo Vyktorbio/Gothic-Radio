@@ -69,7 +69,7 @@
     <p>O progresso conta faixas que começaram a tocar desde o registro no aparelho, incluindo o histórico disponível. Reproduções antigas fora desse registro são desconhecidas.</p>
         <p>Estações, favoritas e histórico ficam apenas neste aparelho, separados por conta. Não há sincronização.</p>
         <details><summary>Gêneros das músicas</summary><p id="genre-coverage"></p>
-          <p>Leitura parcial de tags MP3 e FLAC. Outros formatos e tags extensas podem ficar sem classificação. A leitura automática continua enquanto a rádio estiver visível, com até 64 KB por faixa. Você pode pausar a qualquer momento.</p>
+          <p>Leitura parcial de tags MP3 e FLAC. Outros formatos e tags extensas podem ficar sem classificação. A leitura automática continua enquanto a rádio estiver visível, com até 64 KB por faixa. O acervo completo pode consumir vários GB; prefira Wi-Fi. Você pode pausar a qualquer momento.</p>
           <button id="btn-index-genres">Iniciar leitura automática</button><p id="genre-state" role="status" aria-live="polite"></p><p>O progresso fica salvo. Ao reabrir, a leitura retoma se estiver ativada e houver acesso válido. No iPhone, fechar ou bloquear a tela pode suspender a leitura.</p>
         </details>
   </dialog>
@@ -695,7 +695,8 @@
       return resumeGenreIndexing();
     }
     function resumeGenreIndexing() {
-      if (genreTask) return genreTask;
+      if (genreTask) return genreController?.signal.aborted
+        ? genreTask.then(() => resumeGenreIndexing()) : genreTask;
       if (!personalReady || !personal.genreAuto || !tracks.length) return Promise.resolve();
       const task = runGenreIndexing();
       genreTask = task;
