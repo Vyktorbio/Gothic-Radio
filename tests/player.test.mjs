@@ -492,3 +492,48 @@ test('backup ignores injected extra fields and failed playback stays unheard', a
   assert.equal(app.run('accessToken'), 'unit-test-token');
   assert.equal(app.run("favIds.has('b')"), true);
 });
+
+
+test('backup preview requires confirmation and cancellation leaves state unchanged', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  app.ctx.file = { size: 200, text: async () => JSON.stringify({
+    format:'gothic-radio-personal', version:1, stations:[], history:[], heard:['a'], favorites:['b']
+  }) };
+  await app.run('previewBackup(file)');
+  assert.equal(app.run('favIds.size'), 0);
+  const preview = app.nodes.get('backup-preview');
+  const cancel = preview.children.find(n => n.textContent === 'Cancelar');
+  cancel.onclick();
+  assert.equal(preview.children.length, 0);
+  assert.equal(app.run('favIds.size'), 0);
+  await app.run('previewBackup(file)');
+  await preview.children.find(n => n.textContent === 'Confirmar importação').onclick();
+  assert.equal(app.run("favIds.has('b')"), true);
+  assert.match(app.nodes.get('backup-status').textContent, /importado e salvo/);
+});
+
+test('discovery combines with personal stations and stops when no unheard tracks remain', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  app.run("createStation('One'); setStationMembership(personal.stations[0].id, 'a', true); selectStation('personal:' + personal.stations[0].id); setDiscovery(true)");
+  await app.run('playTrack(tracks[0])');
+  assert.equal(app.run('getQueue().length'), 0);
+  app.nodes.get('audio-player').ended = true;
+  await app.run('audio.onended()');
+  assert.equal(app.run('isPlaying'), false);
+  const request = app.run('playbackRequest');
+  await app.run('resumePlayback()');
+  assert.equal(app.run('playbackRequest'), request);
+});
+
+test('backup disk failure is reported without deleting existing selections', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  app.run("createStation('Keep')");
+  await app.run('personalWrites');
+  app.run("personalTransaction = async () => { throw Error('Quota exceeded'); }");
+  await assert.rejects(app.run("importBackup({ ...makeBackup(), favorites:['b'] })"), /Quota/);
+  assert.equal(app.run('personal.stations[0].name'), 'Keep');
+  assert.equal(app.run('tracks.length'), 3);
+});
