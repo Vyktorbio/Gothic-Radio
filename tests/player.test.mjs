@@ -25,7 +25,7 @@ function boot({ db = new IDBFactory(), values = new Map(), full = false, navigat
     setItem(k, v) { if (full) throw Error('QuotaExceededError'); values.set(k, v); } };
   const window = { indexedDB: db, addEventListener: (name, fn) => events.set(name, fn), open: () => popup };
   const ctx = vm.createContext({ window, document, localStorage, indexedDB: db, navigator, MediaMetadata: class { constructor(data) { Object.assign(this, data); } }, console,
-    setTimeout, clearTimeout, fetch, URL, Response, Blob, structuredClone, AbortController, TextDecoder, crypto: { randomUUID: () => 'station-' + Math.random() } });
+    setTimeout, clearTimeout, fetch, URL, Response, Blob, structuredClone, AbortController, TextDecoder, crypto: { randomUUID: () => 'station-' + Math.floor(Math.random() * 1000000000) } });
   vm.runInContext(script, ctx);
   return { ctx, db, values, nodes, events, popup, run: code => vm.runInContext(code, ctx) };
 }
@@ -388,4 +388,152 @@ test('legacy unscoped IndexedDB catalog survives migration', async () => {
   const reopened = boot({ db });
   await reopened.run('musicReady');
   assert.equal(reopened.run('tracks[0].id'), 'test-1');
+});
+
+
+test('backup roundtrip merges personal selections without touching transport or tokens', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  app.run("createStation('Noite'); setStationMembership(personal.stations[0].id, 'a', true); toggleFavorite(tracks[0])");
+  await app.run('playTrack(tracks[0])');
+  const backup = app.run('JSON.stringify(makeBackup())');
+  assert.doesNotMatch(backup, /unit-test-token|accessToken|email|genres/);
+  app.ctx.backupText = backup;
+  app.run("createStation('Outra'); toggleFavorite(tracks[1])");
+  const src = app.nodes.get('audio-player').src;
+  await app.run('importBackup(parseBackup(backupText))');
+  await app.run('importBackup(parseBackup(backupText))');
+  assert.equal(app.run('personal.stations.length'), 2);
+  assert.equal(app.run('favIds.size'), 2);
+  assert.equal(app.run('personal.history.length'), 1);
+  assert.equal(app.nodes.get('audio-player').src, src);
+  assert.equal(app.run('tracks.length'), 3);
+  const reopened = boot({ db: app.db, values: app.values });
+  await reopened.run('musicReady');
+  assert.equal(reopened.run('personal.stations.length'), 2);
+  assert.equal(reopened.run("heardIds.has('a')"), true);
+});
+
+test('invalid, oversized and future backups cannot change local selections', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  app.run("createStation('Keep')");
+  for (const input of ['{', '{"format":"wrong","version":1}', '{"format":"gothic-radio-personal","version":99}']) {
+    app.ctx.input = input;
+    assert.throws(() => app.run('parseBackup(input)'));
+  }
+  assert.throws(() => app.run("parseBackup(' '.repeat(BACKUP_LIMIT + 1))"));
+  assert.throws(() => app.run("validateBackup({ ...makeBackup(), favorites: ['../bad'] })"));
+  assert.equal(app.run('personal.stations[0].name'), 'Keep');
+});
+
+test('discovery persists beyond recent history and only records successful starts', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  await app.run('playTrack(tracks[0])');
+  app.run("personal.history = []; setDiscovery(true)");
+  assert.equal(app.run("getQueue().map(t=>t.id).join()"), 'b,c');
+  assert.equal(app.run('heardIds.size'), 1);
+  app.run('audio.pause()');
+  await app.run('resumePlayback()');
+  assert.equal(app.run('heardIds.size'), 1);
+  await app.run('personalWrites');
+  const reopened = boot({ db: app.db, values: app.values });
+  await reopened.run('musicReady');
+  assert.equal(reopened.run('onlyUnheard'), true);
+  assert.equal(reopened.run("getQueue().map(t=>t.id).join()"), 'b,c');
+  assert.match(reopened.nodes.get('discovery-progress').textContent, /1 \/ 3/);
+});
+
+test('discovery shuffle respects announced next, station filters and exhaustion', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  app.run('setDiscovery(true); isShuffle = true');
+  await app.run('playTrack(tracks[0])');
+  const announced = app.run('getNextTrack().id');
+  await app.run('nextTrack()');
+  assert.equal(app.run('currentTrack.id'), announced);
+  assert.equal(app.run('getQueue().length'), 1);
+  await app.run('nextTrack()');
+  assert.equal(app.run('getQueue().length'), 0);
+  assert.equal(app.run('getNextTrack()'), null);
+  assert.match(app.nodes.get('next-track-title').textContent, /Nenhuma faixa inédita/);
+  app.run('setDiscovery(false)');
+  assert.equal(app.run('getQueue().length'), 3);
+});
+
+test('backup confirmation is bound to the account that opened it', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  app.ctx.data = app.run('makeBackup()');
+  app.ctx.oldEpoch = app.run('personalEpoch');
+  app.run('loadPublishedCatalog = async () => {}');
+  await app.run("changePersonalAccount('other@example.invalid')");
+  await assert.rejects(app.run('importBackup(data, oldEpoch)'), /conta mudou/);
+  assert.equal(app.run('heardIds.size'), 0);
+});
+
+test('history migrates to discovery while IDs outside the catalog do not inflate progress', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  app.run("personal.history = [{id:'a'}]; personal.heard = ['absent']; restoreDiscovery(); renderUI()");
+  assert.equal(app.run('heardIds.size'), 2);
+  assert.match(app.nodes.get('discovery-progress').textContent, /1 \/ 3/);
+});
+
+test('backup ignores injected extra fields and failed playback stays unheard', async () => {
+  const app = playerFixture({}, async () => { throw Error('offline'); });
+  await app.run('musicReady');
+  await app.run('playTrack(tracks[0])');
+  assert.equal(app.run('heardIds.size'), 0);
+  app.run("personal.extraSecret = 'not-for-export'");
+  assert.doesNotMatch(app.run('JSON.stringify(makeBackup())'), /not-for-export/);
+  await app.run("importBackup({ ...makeBackup(), accessToken:'malicious', favorites:['b'] })");
+  assert.equal(app.run('accessToken'), 'unit-test-token');
+  assert.equal(app.run("favIds.has('b')"), true);
+});
+
+
+test('backup preview requires confirmation and cancellation leaves state unchanged', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  app.ctx.file = { size: 200, text: async () => JSON.stringify({
+    format:'gothic-radio-personal', version:1, stations:[], history:[], heard:['a'], favorites:['b']
+  }) };
+  await app.run('previewBackup(file)');
+  assert.equal(app.run('favIds.size'), 0);
+  const preview = app.nodes.get('backup-preview');
+  const cancel = preview.children.find(n => n.textContent === 'Cancelar');
+  cancel.onclick();
+  assert.equal(preview.children.length, 0);
+  assert.equal(app.run('favIds.size'), 0);
+  await app.run('previewBackup(file)');
+  await preview.children.find(n => n.textContent === 'Confirmar importação').onclick();
+  assert.equal(app.run("favIds.has('b')"), true);
+  assert.match(app.nodes.get('backup-status').textContent, /importado e salvo/);
+});
+
+test('discovery combines with personal stations and stops when no unheard tracks remain', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  app.run("createStation('One'); setStationMembership(personal.stations[0].id, 'a', true); selectStation('personal:' + personal.stations[0].id); setDiscovery(true)");
+  await app.run('playTrack(tracks[0])');
+  assert.equal(app.run('getQueue().length'), 0);
+  app.nodes.get('audio-player').ended = true;
+  await app.run('audio.onended()');
+  assert.equal(app.run('isPlaying'), false);
+  const request = app.run('playbackRequest');
+  await app.run('resumePlayback()');
+  assert.equal(app.run('playbackRequest'), request);
+});
+
+test('backup disk failure is reported without deleting existing selections', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  app.run("createStation('Keep')");
+  await app.run('personalWrites');
+  app.run("personalTransaction = async () => { throw Error('Quota exceeded'); }");
+  await assert.rejects(app.run("importBackup({ ...makeBackup(), favorites:['b'] })"), /Quota/);
+  assert.equal(app.run('personal.stations[0].name'), 'Keep');
+  assert.equal(app.run('tracks.length'), 3);
 });
