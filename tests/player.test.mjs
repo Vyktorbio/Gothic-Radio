@@ -675,3 +675,39 @@ test('switching accounts cancels genre work without copying results or auto pref
   assert.notEqual(app.run('personal.genreAuto'), true);
   assert.equal(app.run('genreRunning'), false);
 });
+
+
+test('rapid pause/start waits for the aborted worker then resumes once', async () => {
+  let app, release, calls = 0;
+  app = genreFixture(async () => {
+    calls++;
+    if (calls === 1) await new Promise(resolve => { release = resolve; });
+    return new Response(new Uint8Array([1]), {status:206});
+  });
+  await app.run('musicReady');
+  const first = app.run('indexGenres()');
+  while (!release) await new Promise(resolve => setTimeout(resolve, 0));
+  await app.run('indexGenres()');
+  const restarted = app.run('indexGenres()');
+  release();
+  await first;
+  await restarted;
+  assert.equal(calls, 4);
+  assert.equal(app.run('Object.keys(personal.genres).length'), 3);
+  assert.equal(app.run('genreRunning'), false);
+});
+
+test('network interruption retries and per-file denial does not block remaining files', async () => {
+  let calls = 0;
+  const app = genreFixture(async () => {
+    calls++;
+    if (calls === 1) throw Error('network');
+    if (calls === 2) return new Response(JSON.stringify({error:{errors:[{reason:'insufficientFilePermissions'}]}}), {status:403});
+    return new Response(new Uint8Array([1]), {status:206});
+  });
+  await app.run('musicReady');
+  await app.run('indexGenres()');
+  assert.equal(calls, 4);
+  assert.equal(app.run('personal.genres.a.status'), 'inaccessible');
+  assert.equal(app.run('Object.keys(personal.genres).length'), 3);
+});
