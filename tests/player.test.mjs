@@ -7,23 +7,23 @@ import { IDBFactory } from 'fake-indexeddb';
 const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 const script = html.match(/<script>\s*([\s\S]*?)<\/script>/)[1];
 const sample = [{ id: 'test-1', title: 'Faixa de teste', artist: 'Artista de teste' }];
-function boot({ db = new IDBFactory(), values = new Map(), full = false, fetch = async () => { throw Error('Network must not be needed to open saved music'); } } = {}) {
+function boot({ db = new IDBFactory(), values = new Map(), full = false, navigator = {}, fetch = async () => { throw Error('Network must not be needed to open saved music'); } } = {}) {
   const events = new Map();
   const nodes = new Map();
   function element() {
     return { textContent: '', value: '', src: '', currentTime: 0, duration: 180, children: [],
       classList: { add() {}, remove() {}, toggle() {} }, setAttribute() {},
       append(...children) { this.children.push(...children); }, appendChild(child) { this.children.push(child); },
-      play: async () => {}, pause() {},
+      paused: true, playbackRate: 1, async play() { this.paused = false; this.onplay?.(); }, pause() { this.paused = true; this.onpause?.(); },
     };
   }
-  const document = { body: element(), querySelector: () => null, createElement: element,
+  const document = { baseURI: 'https://vyktorbio.github.io/Gothic-Radio/', body: element(), querySelector: () => null, createElement: element,
     getElementById(id) { if (!nodes.has(id)) nodes.set(id, element()); return nodes.get(id); } };
   const popup = {};
   const localStorage = { getItem: k => values.get(k) ?? null, removeItem: k => values.delete(k),
     setItem(k, v) { if (full) throw Error('QuotaExceededError'); values.set(k, v); } };
   const window = { indexedDB: db, addEventListener: (name, fn) => events.set(name, fn), open: () => popup };
-  const ctx = vm.createContext({ window, document, localStorage, indexedDB: db, navigator: {}, console,
+  const ctx = vm.createContext({ window, document, localStorage, indexedDB: db, navigator, MediaMetadata: class { constructor(data) { Object.assign(this, data); } }, console,
     setTimeout, clearTimeout, fetch, URL, Response, Blob, structuredClone });
   vm.runInContext(script, ctx);
   return { ctx, db, values, nodes, events, popup, run: code => vm.runInContext(code, ctx) };
@@ -146,4 +146,77 @@ test('the supplied catalog loads all 140121 tracks and renders a bounded page', 
   const reopened = boot({ db: app.db, full: true });
   await reopened.run('musicReady');
   assert.equal(reopened.run('tracks.length'), 140121);
+});
+
+const queueTracks = [
+  { id: 'a', title: 'First', artist: 'One' },
+  { id: 'b', title: 'Second', artist: 'Two' },
+  { id: 'c', title: 'Third', artist: 'Three' },
+];
+function playerFixture(navigator = {}, fetch = async () => new Response(new Blob(['test audio']))) {
+  return boot({ navigator, fetch, values: new Map([
+    ['gothic_radio_tracks_v4', JSON.stringify(queueTracks)],
+    ['gothic_radio_drive_token_v1', 'unit-test-token'],
+    ['gothic_radio_drive_token_exp_v1', String(Date.now() + 3600000)],
+  ]) });
+}
+
+test('lock screen actions control playback, next, previous, metadata and seek position', async () => {
+  const actions = new Map();
+  let position;
+  const mediaSession = { setActionHandler: (name, handler) => actions.set(name, handler), setPositionState: p => { position = p; } };
+  const app = playerFixture({ mediaSession });
+  await app.run('musicReady');
+  await actions.get('play')();
+  assert.equal(mediaSession.playbackState, 'playing');
+  assert.equal(mediaSession.metadata.title, 'First');
+  assert.match(mediaSession.metadata.artwork[0].src, /Gothic-Radio\/pwa-512x512.png$/);
+  await actions.get('nexttrack')();
+  assert.equal(app.run('currentTrack.id'), 'b');
+  assert.equal(app.nodes.get('next-track-title').textContent, 'Third');
+  await actions.get('previoustrack')();
+  assert.equal(app.run('currentTrack.id'), 'a');
+  actions.get('seekto')({ seekTime: 999 });
+  assert.equal(position.position, 180);
+  actions.get('pause')();
+  assert.equal(mediaSession.playbackState, 'paused');
+  assert.equal(actions.get('seekforward'), null);
+  assert.equal(actions.get('seekbackward'), null);
+});
+
+test('shuffle preview stays stable and is the exact next track; previous follows history', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  app.run('isShuffle = true; renderUI()');
+  const announced = app.run('getNextTrack().id');
+  assert.notEqual(announced, 'a');
+  app.run('renderUI(); renderUI()');
+  assert.equal(app.run('getNextTrack().id'), announced);
+  await app.run('nextTrack()');
+  assert.equal(app.run('currentTrack.id'), announced);
+  await app.run('prevTrack()');
+  assert.equal(app.run('currentTrack.id'), 'a');
+});
+
+test('up next follows filters and handles empty and single-track queues', async () => {
+  const app = playerFixture();
+  await app.run('musicReady');
+  app.run("selectedArtist = 'Three'; renderUI()");
+  assert.equal(app.run('getNextTrack().id'), 'c');
+  app.run('isShuffle = true; renderUI()');
+  assert.equal(app.run('getNextTrack().id'), 'c');
+  app.run('onlyFavs = true; renderUI()');
+  assert.equal(app.run('getNextTrack()'), null);
+  assert.equal(app.nodes.get('next-track-title').textContent, 'Nenhuma faixa na fila');
+});
+
+test('one unsupported media action cannot disable the other lock screen controls', () => {
+  const registered = [];
+  playerFixture({ mediaSession: { setActionHandler(name) {
+    if (name === 'seekto') throw Error('Unsupported');
+    registered.push(name);
+  } } });
+  assert.ok(registered.includes('nexttrack'));
+  assert.ok(registered.includes('previoustrack'));
+  assert.ok(registered.includes('seekforward'));
 });
