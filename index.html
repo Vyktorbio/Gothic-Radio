@@ -29,11 +29,22 @@
       <button id="btn-rescan" title="Atualizar músicas" aria-label="Atualizar músicas">Atualizar</button>
     </nav>
     <main>
+      <section class="station-controls" aria-label="Estações">
+        <label for="station-select">Sintonizar</label>
+        <select id="station-select"><option value="all">Todas as músicas</option></select>
+        <button id="btn-manage-station">Editar estação</button>
+        <button id="btn-history">Histórico</button>
+        <p>Estações, favoritas e histórico ficam apenas neste aparelho, separados por conta. Não há sincronização.</p>
+        <details><summary>Gêneros das músicas</summary><p id="genre-coverage"></p>
+          <p>Leitura parcial de tags MP3 e FLAC. Outros formatos e tags extensas podem ficar sem classificação. Cada lote lê até 3,2 MB.</p>
+          <button id="btn-index-genres">Ler gêneros (lote de 50)</button>
+        </details>
+      </section>
       <div id="status-banner" role="status" aria-live="polite" class="hidden"></div>
       <section class="radio-deck" aria-label="Player da Gothic Rádio">
         <div class="radio-status"><span><i aria-hidden="true"></i><span id="play-state-label">Sem sinal</span></span><span id="mode-indicator">Sequência</span></div>
         <div class="radio-track"><h1 id="track-title">—</h1><p id="track-artist">Entre para ouvir</p></div>
-        <div class="radio-track-meta"><span id="station-sub">GOTHIC / 0 faixas</span><button id="btn-fav-current">Favoritar</button></div>
+        <div class="radio-track-meta"><span id="station-sub">GOTHIC / 0 faixas</span><button id="btn-fav-current">Favoritar</button><button id="btn-station-current" aria-label="Opções da música atual">⋯</button></div>
         <div class="radio-seek"><label class="sr-only" for="seek-slider">Posição da música</label><input id="seek-slider" type="range" min="0" max="100" step="0.5" value="0" /><div><span id="time-current">00:00</span><span id="time-total">00:00</span></div></div>
         <div class="radio-transport"><button id="btn-prev" aria-label="Faixa anterior"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5v14M19 5 8 12l11 7Z"/></svg></button><button id="btn-play">Play</button><button id="btn-next" aria-label="Próxima faixa"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 5v14M5 5l11 7-11 7Z"/></svg></button></div>
         <div class="radio-up-next" aria-live="polite"><span class="next-label">A seguir</span><div><p id="next-track-title">—</p><p id="next-track-artist">Escolha uma faixa</p></div></div>
@@ -50,6 +61,7 @@
       <div id="artist-chips"></div><div id="tracks-list"></div>
     </div>
   </div>
+  <dialog id="station-dialog" aria-label="Estações da música"></dialog>
   <span id="vfd-clock" hidden></span>
   <script>
     const storage = {
@@ -67,7 +79,10 @@
 
     let tracks = [];
     try {
-      const saved = JSON.parse(storage.getItem('gothic_radio_tracks_v4') || 'null');
+      const initialOwner = (storage.getItem('radio_drive_user_email_v1') || 'guest').toLowerCase();
+      const oldOwner = (storage.getItem('radio_legacy_owner_v1') || initialOwner).toLowerCase();
+      const saved = JSON.parse(storage.getItem('gothic_radio_tracks_v4:' + initialOwner) ||
+        (initialOwner === oldOwner ? storage.getItem('gothic_radio_tracks_v4') : null) || 'null');
       if (Array.isArray(saved) && saved.length > 0) tracks = saved.filter(t => t && typeof t.id === 'string' && typeof t.title === 'string' && typeof t.artist === 'string');
     } catch (e) {}
     if (tracks.length === 0 && EMBEDDED_TRACKS.length > 0) {
@@ -75,9 +90,11 @@
       try { storage.setItem('gothic_radio_tracks_v4', JSON.stringify(tracks)); } catch (e) {}
     }
 
+    const legacyOwner = storage.getItem('radio_legacy_owner_v1') || storage.getItem('radio_drive_user_email_v1') || 'guest';
+    storage.setItem('radio_legacy_owner_v1', legacyOwner);
     let savedFavorites = [];
     try { const value = JSON.parse(storage.getItem('radio_drive_favorite_ids_v1') || '[]'); if (Array.isArray(value)) savedFavorites = value; } catch {}
-    let favIds = new Set(savedFavorites);
+    let favIds = new Set((storage.getItem('radio_drive_user_email_v1') || 'guest').toLowerCase() === legacyOwner.toLowerCase() ? savedFavorites : []);
     let savedEmail = storage.getItem('radio_drive_user_email_v1') || EMBEDDED_EMAIL || '';
     let accessToken = storage.getItem('gothic_radio_drive_token_v1') || storage.getItem('radio_drive_token_v1') || EMBEDDED_TOKEN || null;
     let tokenExpiresAt = Number(storage.getItem('gothic_radio_drive_token_exp_v1') || storage.getItem('radio_drive_token_exp_v1') || (EMBEDDED_TOKEN ? String(Date.now() + 50 * 60 * 1000) : '0'));
@@ -86,7 +103,7 @@
     let isShuffle = false;
     let searchQuery = '';
     let savedPlayback = {};
-    try { savedPlayback = JSON.parse(storage.getItem('gothic_radio_playback_v1') || '{}') || {}; } catch {}
+    try { savedPlayback = JSON.parse(storage.getItem('gothic_radio_playback_v1:' + (savedEmail.toLowerCase() || 'guest')) || ((savedEmail || 'guest').toLowerCase() === legacyOwner.toLowerCase() ? storage.getItem('gothic_radio_playback_v1') : null) || '{}') || {}; } catch {}
     let currentTrack = tracks.find(t => t.id === savedPlayback.trackId) || tracks[0] || null;
     let memoryRevision = 0;
     let visibleTrackLimit = 100;
@@ -107,6 +124,372 @@
     document.getElementById('vol-slider').value = audio.volume;
     document.getElementById('vol-label').textContent = Math.round(audio.volume * 100) + '%';
 
+
+    // Personal data is local to this browser, partitioned by signed-in account.
+    let personal = { stations: [], history: [], genres: {}, favorites: [...favIds] };
+    let personalOwner = savedEmail.trim().toLowerCase() || 'guest';
+    let personalReady = false, personalEpoch = 0, personalWrites = Promise.resolve();
+    let selectedStation = 'all', historyView = false, historyRecorded = -1;
+    let stationQueueIds = null;
+    let prefetchJob = null, activeDownload = null, genreController = null;
+    let genreRunning = false;
+    const PREFETCH_LIMIT = 32 * 1024 * 1024;
+    const personalKey = () => 'personal-v1:' + personalOwner;
+    async function personalTransaction(mode, action) {
+      const db = await openMusicMemory();
+      try {
+        return await new Promise((resolve, reject) => {
+          const tx = db.transaction('folder_memory', mode);
+          const req = action(tx.objectStore('folder_memory'));
+          tx.oncomplete = () => resolve(req?.result);
+          tx.onerror = tx.onabort = () => reject(tx.error || Error('Storage failed'));
+        });
+      } finally { db.close(); }
+    }
+    function persistPersonal() {
+      const key = personalKey();
+      personal.favorites = [...favIds];
+      const snapshot = structuredClone(personal);
+      personalWrites = personalWrites.catch(() => {}).then(() =>
+        personalTransaction('readwrite', store => store.put(snapshot, key)));
+      personalWrites.catch(() => showStatus('Não foi possível salvar suas estações e histórico neste aparelho.'));
+      return personalWrites;
+    }
+    async function restorePersonal() {
+      const epoch = ++personalEpoch;
+      personalReady = false;
+      try {
+        const data = await personalTransaction('readonly', store => store.get(personalKey()));
+        if (epoch !== personalEpoch) return;
+        if (data && Array.isArray(data.stations) && Array.isArray(data.history)) {
+          personal = data;
+          personal.genres ||= {};
+          favIds = new Set(data.favorites || []);
+        }
+        personalReady = true;
+        renderUI();
+      } catch {
+        showStatus('Memória pessoal indisponível. Libere espaço ou permita armazenamento para salvar estações.');
+      }
+    }
+    async function changePersonalAccount(email) {
+      const owner = email.trim().toLowerCase() || 'guest';
+      if (owner === personalOwner) return;
+      ++playbackRequest;
+      audio.pause();
+      if (audio.src.startsWith('blob:')) URL.revokeObjectURL(audio.src);
+      audio.removeAttribute?.('src');
+      loadedTrackId = null;
+      prefetchJob?.controller.abort(); prefetchJob = null;
+      activeDownload?.controller.abort(); activeDownload = null;
+      genreController?.abort(); genreRunning = false;
+      playbackHistory = [];
+      historyRecorded = -1;
+      selectedStation = 'all'; stationQueueIds = null; historyView = false; nextPlan = null;
+      onlyFavs = false; selectedArtist = 'ALL'; searchQuery = '';
+      // Flush the old account before changing ownership; never migrate its data to another account.
+      if (personalReady) await persistPersonal().catch(() => {});
+      ++personalEpoch;
+      personalOwner = owner;
+      memoryRevision++;
+      tracks = []; currentTrack = null; savedPlayback = {}; restoreTrackTime = false;
+      personal = { stations: [], history: [], genres: {}, favorites: [] };
+      favIds = new Set();
+      await restorePersonal();
+      await loadPublishedCatalog();
+    }
+    function toggleFavorite(track) {
+      if (!track || !personalReady) return;
+      if (favIds.has(track.id)) favIds.delete(track.id); else favIds.add(track.id);
+      void persistPersonal();
+      renderUI();
+    }
+    function createStation(name) {
+      name = String(name || '').trim().slice(0, 80);
+      if (!personalReady || !name) return null;
+      const station = { id: crypto.randomUUID(), name, ids: [] };
+      personal.stations.push(station);
+      void persistPersonal();
+      return station;
+    }
+    function setStationMembership(stationId, trackId, included) {
+      const station = personal.stations.find(s => s.id === stationId);
+      if (!personalReady || !station) return;
+      station.ids = [...new Set(included ? [...station.ids, trackId] : station.ids.filter(id => id !== trackId))];
+      void persistPersonal();
+      // Membership editing intentionally leaves the active queue snapshot and next plan unchanged.
+    }
+    function selectStation(value) {
+      selectedStation = value;
+      onlyFavs = value === 'favorites';
+      selectedArtist = 'ALL'; searchQuery = ''; historyView = false;
+      document.getElementById('search-input').value = '';
+      stationQueueIds = value.startsWith('personal:')
+        ? new Set(personal.stations.find(s => s.id === value.slice(9))?.ids || []) : null;
+      nextPlan = null; visibleTrackLimit = 100;
+      renderUI();
+    }
+    function stationAllows(track) {
+      if (stationQueueIds && !stationQueueIds.has(track.id)) return false;
+      if (selectedStation.startsWith('genre:'))
+        return (personal.genres[track.id]?.values || normalizeGenres(track.genres || track.genre || [])).includes(selectedStation.slice(6));
+      return true;
+    }
+    function node(tag, text, parent) {
+      const el = document.createElement(tag);
+      if (text !== undefined) el.textContent = text;
+      parent?.appendChild(el);
+      return el;
+    }
+    function action(text, fn, parent) {
+      const el = node('button', text, parent); el.type = 'button'; el.onclick = fn; return el;
+    }
+    function openStationMenu(track) {
+      if (!track) return;
+      const dialog = document.getElementById('station-dialog');
+      dialog.innerHTML = '';
+      node('h2', 'Salvar em estação', dialog);
+      node('p', track.title + ' — ' + track.artist, dialog);
+      if (!personalReady) node('p', 'Aguarde a memória deste aparelho.', dialog);
+      else {
+        for (const station of personal.stations) {
+          const label = node('label', undefined, dialog);
+          const input = node('input', undefined, label);
+          input.type = 'checkbox'; input.checked = station.ids.includes(track.id);
+          node('span', station.name, label);
+          input.onchange = () => setStationMembership(station.id, track.id, input.checked);
+        }
+        const input = node('input', undefined, dialog);
+        input.placeholder = 'Nome da nova estação'; input.maxLength = 80;
+        input.setAttribute('aria-label', 'Nome da nova estação');
+        action('Criar e salvar', () => {
+          const station = createStation(input.value);
+          if (station) { setStationMembership(station.id, track.id, true); openStationMenu(track); }
+        }, dialog);
+        action(favIds.has(track.id) ? 'Remover das favoritas' : 'Favoritar', () => {
+          toggleFavorite(track); openStationMenu(track);
+        }, dialog);
+      }
+      action('Fechar', () => dialog.close(), dialog);
+      if (!dialog.open) dialog.showModal();
+    }
+    function renderPersonalUI() {
+      const selector = document.getElementById('station-select');
+      selector.innerHTML = '';
+      const option = (parent, value, label) => { const el = node('option', label, parent); el.value = value; };
+      option(selector, 'all', 'Todas as músicas');
+      option(selector, 'favorites', 'Favoritas');
+      const manual = node('optgroup', undefined, selector); manual.label = 'Minhas estações';
+      personal.stations.forEach(s => option(manual, 'personal:' + s.id, s.name));
+      const genres = new Set();
+      let checked = 0, tagged = 0;
+      for (const track of tracks) {
+        const entry = personal.genres[track.id];
+        const values = entry?.values || normalizeGenres(track.genres || track.genre || []);
+        if (entry || values.length) checked++;
+        if (values.length) tagged++;
+        values.forEach(g => genres.add(g));
+      }
+      const automatic = node('optgroup', undefined, selector); automatic.label = 'Por gênero';
+      [...genres].sort().forEach(g => option(automatic, 'genre:' + g, g));
+      selector.value = selectedStation;
+      document.getElementById('genre-coverage').textContent =
+        'Gêneros: ' + tagged.toLocaleString('pt-BR') + ' faixas classificadas · ' + checked.toLocaleString('pt-BR') + ' / ' +
+        tracks.length.toLocaleString('pt-BR') + ' examinadas. Cobertura parcial.';
+      document.getElementById('btn-index-genres').textContent = genreRunning ? 'Pausar leitura de gêneros' : 'Ler gêneros (lote de 50)';
+      document.getElementById('btn-manage-station').disabled = !selectedStation.startsWith('personal:');
+      if (historyView) {
+        const list = document.getElementById('tracks-list'); list.innerHTML = '';
+        document.getElementById('drawer-count').textContent = personal.history.length;
+        for (const entry of personal.history) {
+          const track = tracks.find(t => t.id === entry.id) || entry;
+          const row = node('div', undefined, list); row.className = 'track-row track-with-menu';
+          action(track.title + ' — ' + track.artist, () => playTrack(track), row);
+          const menu = action('⋯', () => openStationMenu(track), row);
+          menu.setAttribute('aria-label', 'Opções de ' + track.title);
+        }
+        if (!personal.history.length) node('p', 'Nenhuma faixa tocada neste aparelho.', list);
+      }
+    }
+    function manageStation() {
+      const station = personal.stations.find(s => 'personal:' + s.id === selectedStation);
+      if (!station) return;
+      const dialog = document.getElementById('station-dialog'); dialog.innerHTML = '';
+      node('h2', 'Editar estação', dialog);
+      const input = node('input', undefined, dialog); input.value = station.name; input.maxLength = 80;
+      input.setAttribute('aria-label', 'Nome da estação');
+      action('Renomear', () => {
+        if (!input.value.trim()) return;
+        station.name = input.value.trim(); void persistPersonal(); renderUI(); dialog.close();
+      }, dialog);
+      action('Excluir estação…', () => {
+        if (!confirm('Excluir “' + station.name + '”? Somente esta seleção será removida; as músicas serão mantidas.')) return;
+        personal.stations = personal.stations.filter(s => s.id !== station.id);
+        void persistPersonal(); selectStation('all'); dialog.close();
+      }, dialog);
+      action('Fechar', () => dialog.close(), dialog); dialog.showModal();
+    }
+    async function readBoundedResponse(response, limit, controller) {
+      const length = Number(response.headers.get('content-length'));
+      if (length > limit) { controller.abort(); throw Error('Size limit'); }
+      const reader = response.body?.getReader();
+      if (!reader) throw Error('Streaming unavailable');
+      const chunks = []; let total = 0;
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          total += value.byteLength;
+          if (total > limit) { controller.abort(); throw Error('Size limit'); }
+          chunks.push(value);
+        }
+      } finally { reader.releaseLock(); }
+      return new Blob(chunks, { type: response.headers.get('content-type') || 'application/octet-stream' });
+    }
+    function makeAudioJob(track, background) {
+      const controller = new AbortController();
+      const owner = personalOwner;
+      const job = { id: track.id, controller, owner, background, promise: null };
+      job.promise = (async () => {
+        const tok = await ensureValidToken(false);
+        if (!tok || controller.signal.aborted) throw Error('Login required');
+        const res = await fetch('https://www.googleapis.com/drive/v3/files/' +
+          encodeURIComponent(track.streamFileId || track.id) + '?alt=media&supportsAllDrives=true', {
+            headers: { Authorization: 'Bearer ' + tok }, signal: controller.signal
+          });
+        if (!res.ok) { controller.abort(); throw Error('Audio ' + res.status); }
+        // One speculative track only. Never write speculative audio to persistent cache.
+        const blob = background ? await readBoundedResponse(res, PREFETCH_LIMIT, controller) : await res.blob();
+        if (owner !== personalOwner || controller.signal.aborted) throw Error('Obsolete audio');
+        return blob;
+      })();
+      job.promise.catch(() => {});
+      return job;
+    }
+    function prepareNext(track) {
+      if (prefetchJob && prefetchJob.id !== track?.id) { prefetchJob.controller.abort(); prefetchJob = null; }
+      if (!track || !isPlaying || loadedTrackId !== currentTrack?.id || track.id === currentTrack.id ||
+          navigator.connection?.saveData || navigator.connection?.effectiveType === '2g' ||
+          track.sizeBytes > PREFETCH_LIMIT || !accessToken || Date.now() >= tokenExpiresAt - 60000) return;
+      if (!prefetchJob) prefetchJob = makeAudioJob(track, true);
+    }
+    async function acquireAudio(track) {
+      activeDownload?.controller.abort();
+      let job;
+      if (prefetchJob?.id === track.id && prefetchJob.owner === personalOwner) {
+        job = prefetchJob; prefetchJob = null;
+      } else {
+        prefetchJob?.controller.abort(); prefetchJob = null;
+        job = makeAudioJob(track, false);
+      }
+      activeDownload = job;
+      try { return await job.promise; }
+      catch (error) {
+        // A speculative failure can be retried by the foreground request, never by background login.
+        if (!job.background || job.controller.signal.aborted || job.owner !== personalOwner) throw error;
+        const retry = makeAudioJob(track, false); activeDownload = retry;
+        return await retry.promise;
+      } finally { if (activeDownload === job) activeDownload = null; }
+    }
+    function normalizeGenres(value) {
+      const aliases = { 'post punk': 'post-punk', 'postpunk': 'post-punk', 'dark wave': 'darkwave',
+        'cold wave': 'coldwave', 'synth pop': 'synthpop', 'synth-pop': 'synthpop',
+        'electronic body music': 'ebm', 'gothic rock': 'gothic rock' };
+      return [...new Set((Array.isArray(value) ? value : [value]).flatMap(v =>
+        String(v).split(/[;\u0000]/)).map(v => v.trim().toLowerCase().replace(/\s+/g, ' '))
+        .filter(Boolean).map(v => aliases[v] || v))];
+    }
+    // Conservative partial parser: only complete ID3 text frames and FLAC Vorbis comments.
+    // Other formats and oversized/incomplete tags remain explicitly unresolved.
+    function parsePartialGenres(bytes) {
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const ascii = (start, length) => String.fromCharCode(...bytes.slice(start, start + length));
+      const sync = p => ((bytes[p] & 127) * 2097152 + (bytes[p+1] & 127) * 16384 + (bytes[p+2] & 127) * 128 + (bytes[p+3] & 127));
+      const values = [];
+      let status = 'unsupported';
+      if (ascii(0, 3) === 'ID3' && bytes.length >= 10 && [3,4].includes(bytes[3])) {
+        const end = 10 + sync(6);
+        if (end > bytes.length || (bytes[5] & 0xc0)) return { values: [], status: 'partial' };
+        status = 'empty';
+        for (let p = 10; p + 10 <= end;) {
+          const id = ascii(p, 4);
+          if (!bytes[p]) break;
+          const size = bytes[3] === 4 ? sync(p+4) : view.getUint32(p+4);
+          if (!size || p + 10 + size > end) return { values: [], status: 'partial' };
+          if (id === 'TCON' && bytes[p+8] === 0 && bytes[p+9] === 0) {
+            const enc = bytes[p+10];
+            if (enc <= 3) {
+              const encoding = ['windows-1252', 'utf-16', 'utf-16be', 'utf-8'][enc];
+              const text = new TextDecoder(encoding).decode(bytes.slice(p+11, p+10+size)).replace(/\u0000+$/, '');
+              // Numeric ID3v1 genre references require a genre table; do not invent labels.
+              if (/^\(?\d+\)?$/.test(text)) status = 'unsupported';
+              else values.push(text);
+            }
+          }
+          p += 10 + size;
+        }
+      } else if (ascii(0, 4) === 'fLaC') {
+        let p = 4;
+        status = 'partial';
+        while (p + 4 <= bytes.length) {
+          const last = !!(bytes[p] & 128), type = bytes[p] & 127;
+          const size = bytes[p+1] * 65536 + bytes[p+2] * 256 + bytes[p+3];
+          const end = p + 4 + size; p += 4;
+          if (end > bytes.length) break;
+          if (type === 4) {
+            if (p + 4 > end) break;
+            const vendor = view.getUint32(p, true); p += 4 + vendor;
+            if (p + 4 > end) break;
+            const count = view.getUint32(p, true); p += 4;
+            for (let i = 0; i < count && p + 4 <= end; i++) {
+              const length = view.getUint32(p, true); p += 4;
+              if (p + length > end) return { values: [], status: 'partial' };
+              const text = new TextDecoder().decode(bytes.slice(p, p+length)); p += length;
+              if (/^GENRE=/i.test(text)) values.push(text.slice(6));
+            }
+            status = 'empty';
+          }
+          p = end;
+          if (last) { status = 'empty'; break; }
+        }
+      }
+      const normalized = normalizeGenres(values);
+      return { values: normalized, status: normalized.length ? 'tagged' : status };
+    }
+    async function indexGenres() {
+      if (genreRunning) { genreController?.abort(); genreRunning = false; renderUI(); return; }
+      if (!personalReady) return;
+      const tok = await ensureValidToken(false);
+      if (!tok) { showStatus('Toque em Entrar antes de ler gêneros.'); return; }
+      genreRunning = true;
+      const epoch = personalEpoch, controller = new AbortController(); genreController = controller;
+      const pending = tracks.filter(t => !personal.genres[t.id] && !normalizeGenres(t.genres || t.genre || []).length).slice(0, 50);
+      try {
+        for (const track of pending) {
+          if (controller.signal.aborted || epoch !== personalEpoch) break;
+          const res = await fetch('https://www.googleapis.com/drive/v3/files/' +
+            encodeURIComponent(track.streamFileId || track.id) + '?alt=media&supportsAllDrives=true', {
+              headers: { Authorization: 'Bearer ' + tok, Range: 'bytes=0-65535' }, signal: controller.signal
+            });
+          if (res.status !== 206) {
+            await res.body?.cancel();
+            throw Error('Partial reads unavailable or access/rate limit');
+          }
+          const blob = await readBoundedResponse(res, 65536, controller);
+          const result = parsePartialGenres(new Uint8Array(await blob.arrayBuffer()));
+          if (controller.signal.aborted || epoch !== personalEpoch) break;
+          personal.genres[track.id] = result;
+          await persistPersonal();
+          renderUI();
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      } catch {
+        if (!controller.signal.aborted) showStatus('Leitura de gêneros pausada. Verifique o acesso ou tente mais tarde; o progresso foi mantido.');
+      } finally {
+        if (epoch === personalEpoch) { genreRunning = false; renderUI(); }
+      }
+    }
+
     function openMusicMemory() {
       return new Promise((resolve, reject) => {
         if (!('indexedDB' in window)) return reject(new Error('Storage unavailable'));
@@ -121,17 +504,18 @@
     }
 
     async function writeMusicMemory(list) {
+      const owner = personalOwner;
       const snapshot = { tracks: list, meta: { folderId: COLECAO_FOLDER_ID, trackCount: list.length, lastSyncedAt: new Date().toISOString(), scanComplete: true, catalogVersion } };
-      const localSaved = storage.setItem('gothic_radio_tracks_v4', JSON.stringify(list));
-      storage.setItem('gothic_radio_meta_v4', JSON.stringify(snapshot.meta));
-      if (!localSaved) storage.removeItem('gothic_radio_tracks_v4');
+      const localSaved = storage.setItem('gothic_radio_tracks_v4:' + personalOwner, JSON.stringify(list));
+      storage.setItem('gothic_radio_meta_v4:' + personalOwner, JSON.stringify(snapshot.meta));
+      if (!localSaved) storage.removeItem('gothic_radio_tracks_v4:' + personalOwner);
       let db;
       let databaseSaved = false;
       try {
         db = await openMusicMemory();
         await new Promise((resolve, reject) => {
           const tx = db.transaction('folder_memory', 'readwrite');
-          tx.objectStore('folder_memory').put(snapshot, 'gothic_radio_snapshot_v4');
+          tx.objectStore('folder_memory').put(snapshot, 'gothic_radio_snapshot_v4:' + owner);
           tx.oncomplete = resolve;
           tx.onerror = () => reject(tx.error);
           tx.onabort = () => reject(tx.error);
@@ -149,13 +533,13 @@
         db = await openMusicMemory();
         const saved = await new Promise((resolve, reject) => {
           const tx = db.transaction('folder_memory', 'readonly');
-          const request = tx.objectStore('folder_memory').get('gothic_radio_snapshot_v4');
+          const request = tx.objectStore('folder_memory').get('gothic_radio_snapshot_v4:' + personalOwner);
           request.onsuccess = () => resolve(request.result);
           request.onerror = () => reject(request.error);
         });
         if (revision !== memoryRevision || !Array.isArray(saved?.tracks) || saved.meta?.folderId !== COLECAO_FOLDER_ID) return;
         let localMeta = null;
-        try { localMeta = JSON.parse(storage.getItem('gothic_radio_meta_v4') || 'null'); } catch {}
+        try { localMeta = JSON.parse(storage.getItem('gothic_radio_meta_v4:' + personalOwner) || (personalOwner === legacyOwner.toLowerCase() ? storage.getItem('gothic_radio_meta_v4') : null) || 'null'); } catch {}
         if (tracks.length && localMeta?.lastSyncedAt && localMeta.lastSyncedAt > (saved.meta?.lastSyncedAt || '')) return;
         catalogVersion = saved.meta?.catalogVersion || null;
         tracks = saved.tracks.filter(t => t && typeof t.id === 'string' && typeof t.title === 'string' && typeof t.artist === 'string');
@@ -167,7 +551,7 @@
     function rememberPlayback() {
       const time = audio.src ? audio.currentTime : (savedPlayback.trackId === currentTrack?.id ? savedPlayback.time || 0 : 0);
       savedPlayback = { trackId: currentTrack?.id || null, time, volume: audio.volume, shuffle: isShuffle };
-      storage.setItem('gothic_radio_playback_v1', JSON.stringify(savedPlayback));
+      storage.setItem('gothic_radio_playback_v1:' + personalOwner, JSON.stringify(savedPlayback));
     }
     window.addEventListener('pagehide', rememberPlayback);
     audio.onpause = () => { isPlaying = false; rememberPlayback(); updateMediaPosition(); renderUI(); };
@@ -180,7 +564,8 @@
       updateMediaPosition();
     };
 
-    function saveToken(tok, email, incomingTracks) {
+    async function saveToken(tok, email, incomingTracks) {
+      await changePersonalAccount(email || savedEmail);
       if (typeof tok !== 'string' || !tok.trim()) return;
       if (!tracks.length && Array.isArray(incomingTracks) && incomingTracks.length) {
         tracks = incomingTracks.filter(t => t && typeof t.id === 'string' && typeof t.title === 'string' && typeof t.artist === 'string');
@@ -244,7 +629,7 @@
         try {
           const result = await window.gothicRadioSignIn(savedEmail);
           if (!result?.accessToken) throw new Error('missing-token');
-          saveToken(result.accessToken, result.email || '');
+          await saveToken(result.accessToken, result.email || '');
           return accessToken;
         } catch (error) {
           const messages = {
@@ -359,6 +744,7 @@
 
     function getQueue() {
       return tracks.filter(t => {
+        if (!stationAllows(t)) return false;
         if (onlyFavs && !favIds.has(t.id)) return false;
         if (selectedArtist !== 'ALL' && t.artist !== selectedArtist) return false;
         if (searchQuery && !(t.title.toLowerCase().includes(searchQuery) || t.artist.toLowerCase().includes(searchQuery))) return false;
@@ -376,38 +762,13 @@
       audio.pause();
       restoreTrackTime = track.id === savedPlayback.trackId;
       currentTrack = track;
-      renderUI();
       try {
         showStatus('CARREGANDO ÁUDIO...');
-        const cache = ('caches' in window) ? await caches.open('gothic-radio-audio-cache-v1') : null;
-        const cacheKey = 'https://gothic-radio.local/audio/' + encodeURIComponent(track.id);
-        let blob = null;
-        if (cache) {
-          const hit = await cache.match(cacheKey);
-          if (hit) blob = await hit.blob();
+        if (!await ensureValidToken(false)) {
+          if (!await ensureValidToken(true)) return;
         }
-        if (!blob) {
-          let tok = await ensureValidToken(false);
-          if (!tok) {
-            tok = await ensureValidToken(true);
-          }
-          if (!tok) return;
-          const id = track.streamFileId || track.id;
-          let res = await fetch('https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(id) + '?alt=media&supportsAllDrives=true', {
-            headers: { Authorization: 'Bearer ' + tok }
-          });
-          if (res.status === 401 || res.status === 403) {
-            accessToken = null;
-            tok = await ensureValidToken(true);
-            if (!tok) return;
-            res = await fetch('https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(id) + '?alt=media&supportsAllDrives=true', {
-              headers: { Authorization: 'Bearer ' + tok }
-            });
-          }
-          if (!res.ok) throw new Error('Status ' + res.status);
-          blob = await res.blob();
-          if (cache) await cache.put(cacheKey, new Response(blob));
-        }
+        if (request !== playbackRequest) return;
+        const blob = await acquireAudio(track);
         if (request !== playbackRequest) return;
         loadedTrackId = track.id;
         if (audio.src.startsWith('blob:')) URL.revokeObjectURL(audio.src);
@@ -428,7 +789,7 @@
 
     function getNextTrack(q = getQueue()) {
       if (!q.length) { nextPlan = null; return null; }
-      const key = JSON.stringify([currentTrack?.id, isShuffle, onlyFavs, selectedArtist, searchQuery, memoryRevision, q.length]);
+      const key = JSON.stringify([currentTrack?.id, isShuffle, onlyFavs, selectedArtist, searchQuery, memoryRevision, selectedStation, q.length]);
       if (nextPlan?.key === key) {
         const planned = q.find(t => t.id === nextPlan.id);
         if (planned) return planned;
@@ -514,6 +875,7 @@
     function renderUI() {
       const q = getQueue();
       const upcoming = getNextTrack(q);
+      prepareNext(upcoming);
       document.getElementById('next-track-title').textContent = upcoming?.title || 'Nenhuma faixa na fila';
       document.getElementById('next-track-artist').textContent = upcoming?.artist || 'Escolha músicas ou ajuste os filtros';
       document.body.classList.toggle('is-playing', isPlaying);
@@ -547,7 +909,7 @@
       const listEl = document.getElementById('tracks-list');
       listEl.innerHTML = '';
       q.slice(0, visibleTrackLimit).forEach(t => {
-        const row = document.createElement('button');
+        const row = document.createElement('div');
         row.type = 'button';
         row.className = 'track-row' + (currentTrack?.id === t.id ? ' selected' : '');
         const text = document.createElement('div');
@@ -559,8 +921,13 @@
         artist.className = 'track-row-artist';
         artist.textContent = t.artist;
         text.append(title, artist);
-        row.append(text);
-        row.onclick = () => { playTrack(t); document.getElementById('drawer').classList.add('hidden'); };
+        const play = document.createElement('button');
+        play.type = 'button'; play.className = 'track-play'; play.append(text);
+        play.onclick = () => { playTrack(t); document.getElementById('drawer').classList.add('hidden'); };
+        row.className += ' track-with-menu';
+        row.append(play);
+        const menu = action('⋯', () => openStationMenu(t), row);
+        menu.setAttribute('aria-label', 'Opções de ' + t.title);
         listEl.appendChild(row);
       });
       if (q.length > visibleTrackLimit) {
@@ -571,29 +938,40 @@
         listEl.appendChild(more);
       }
 
+      renderPersonalUI();
     }
 
-    document.getElementById('brand-reset').onclick = () => { onlyFavs = false; selectedArtist = 'ALL'; searchQuery = ''; renderUI(); };
+    document.getElementById('brand-reset').onclick = () => selectStation('all');
     document.getElementById('btn-connect').onclick = async () => {
       const tok = await ensureValidToken(true);
       if (tok && tracks.length === 0) scanColecao(true);
       else renderUI();
     };
     document.getElementById('btn-rescan').onclick = () => scanColecao(true);
-    document.getElementById('btn-open-menu').onclick = () => document.getElementById('drawer').classList.remove('hidden');
-    document.getElementById('btn-search-top').onclick = () => document.getElementById('drawer').classList.remove('hidden');
+    document.getElementById('btn-open-menu').onclick = () => { historyView = false; renderUI(); document.getElementById('drawer').classList.remove('hidden'); };
+    document.getElementById('btn-search-top').onclick = () => { historyView = false; renderUI(); document.getElementById('drawer').classList.remove('hidden'); };
     document.getElementById('btn-close-drawer').onclick = () => document.getElementById('drawer').classList.add('hidden');
-    document.getElementById('btn-top-favs').onclick = () => { onlyFavs = !onlyFavs; renderUI(); };
+    document.getElementById('btn-top-favs').onclick = () => selectStation(onlyFavs ? 'all' : 'favorites');
     document.getElementById('btn-play').onclick = () => { if (audio.paused || !audio.src) void resumePlayback(); else audio.pause(); };
     document.getElementById('btn-next').onclick = nextTrack;
     document.getElementById('btn-prev').onclick = prevTrack;
     document.getElementById('btn-shuffle').onclick = () => { isShuffle = !isShuffle; renderUI(); };
-    document.getElementById('btn-only-favs').onclick = () => { onlyFavs = !onlyFavs; renderUI(); };
-    document.getElementById('btn-fav-current').onclick = () => {
-      if (!currentTrack) return;
-      if (favIds.has(currentTrack.id)) favIds.delete(currentTrack.id); else favIds.add(currentTrack.id);
-      storage.setItem('radio_drive_favorite_ids_v1', JSON.stringify(Array.from(favIds)));
-      renderUI();
+    document.getElementById('btn-only-favs').onclick = () => selectStation(onlyFavs ? 'all' : 'favorites');
+    document.getElementById('btn-fav-current').onclick = () => toggleFavorite(currentTrack);
+    document.getElementById('btn-station-current').onclick = () => openStationMenu(currentTrack);
+    document.getElementById('station-select').onchange = e => selectStation(e.target.value);
+    document.getElementById('btn-manage-station').onclick = manageStation;
+    document.getElementById('btn-index-genres').onclick = indexGenres;
+    document.getElementById('btn-history').onclick = () => {
+      historyView = true; renderUI(); document.getElementById('drawer').classList.remove('hidden');
+    };
+    audio.onplaying = () => {
+      if (!personalReady || loadedTrackId !== currentTrack?.id || historyRecorded === playbackRequest) return;
+      historyRecorded = playbackRequest;
+      personal.history.unshift({ id: currentTrack.id, streamFileId: currentTrack.streamFileId,
+        title: currentTrack.title, artist: currentTrack.artist, playedAt: Date.now() });
+      personal.history = personal.history.slice(0, 200);
+      void persistPersonal();
     };
     document.getElementById('seek-slider').oninput = (e) => {
       audio.currentTime = Number(e.target.value || 0);
@@ -674,7 +1052,8 @@
         if (revision === memoryRevision) showStatus('Não foi possível carregar a lista. Verifique a conexão e tente abrir novamente.');
       }
     }
-    const musicReady = loadPublishedCatalog();
+    const personalLoaded = restorePersonal();
+    const musicReady = Promise.all([loadPublishedCatalog(), personalLoaded]);
   </script>
   <script type="module" src="/src/player-install.tsx"></script>
 </body>
