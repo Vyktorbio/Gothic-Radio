@@ -21,7 +21,7 @@
   <div class="radio-shell">
     <header class="radio-header">
       <button id="brand-reset" class="radio-wordmark" aria-label="Gothic Rádio, mostrar todas as músicas">Gothic<span>rádio</span></button>
-      <div class="radio-account"><div id="install-control"></div><button id="btn-connect">Entrar</button></div>
+      <div class="radio-account"><div id="install-control"></div><button id="btn-connect">Entrar</button><button id="btn-settings" aria-label="Configurações" title="Configurações">⚙</button></div>
     </header>
     <nav class="radio-nav" aria-label="Músicas">
       <button id="btn-open-menu">Músicas <span id="count-total">0</span></button>
@@ -34,11 +34,7 @@
         <select id="station-select"><option value="all">Todas as músicas</option></select>
         <button id="btn-manage-station">Editar estação</button>
         <button id="btn-history">Histórico</button>
-        <p>Estações, favoritas e histórico ficam apenas neste aparelho, separados por conta. Não há sincronização.</p>
-        <details><summary>Gêneros das músicas</summary><p id="genre-coverage"></p>
-          <p>Leitura parcial de tags MP3 e FLAC. Outros formatos e tags extensas podem ficar sem classificação. Cada lote lê até 3,2 MB.</p>
-          <button id="btn-index-genres">Ler gêneros (lote de 50)</button>
-        </details>
+        <div class="discovery-controls"><button id="btn-unheard" aria-pressed="false">Somente nunca tocadas</button><p id="discovery-progress"></p></div>
       </section>
       <div id="status-banner" role="status" aria-live="polite" class="hidden"></div>
       <section class="radio-deck" aria-label="Player da Gothic Rádio">
@@ -62,6 +58,21 @@
     </div>
   </div>
   <dialog id="station-dialog" aria-label="Estações da música"></dialog>
+  <dialog id="settings-dialog" aria-labelledby="settings-title">
+    <div class="drawer-heading"><h2 id="settings-title">Configurações</h2><button id="btn-close-settings" aria-label="Fechar configurações">×</button></div>
+    <h3>Backup pessoal</h3>
+    <p>Exporte estações, favoritas, histórico e faixas ouvidas para guardar ou levar a outro aparelho. O arquivo não contém músicas nem dados de login.</p>
+    <button id="btn-export-backup">Exportar backup</button>
+    <label class="backup-file">Importar backup<input id="backup-file" type="file" accept=".json,application/json" /></label>
+    <p id="backup-status" role="status" aria-live="polite"></p>
+    <div id="backup-preview"></div>
+    <p>O progresso conta faixas que começaram a tocar desde o registro no aparelho, incluindo o histórico disponível. Reproduções antigas fora desse registro são desconhecidas.</p>
+        <p>Estações, favoritas e histórico ficam apenas neste aparelho, separados por conta. Não há sincronização.</p>
+        <details><summary>Gêneros das músicas</summary><p id="genre-coverage"></p>
+          <p>Leitura parcial de tags MP3 e FLAC. Outros formatos e tags extensas podem ficar sem classificação. Cada lote lê até 3,2 MB.</p>
+          <button id="btn-index-genres">Ler gêneros (lote de 50)</button>
+        </details>
+  </dialog>
   <span id="vfd-clock" hidden></span>
   <script>
     const storage = {
@@ -134,6 +145,158 @@
     let prefetchJob = null, activeDownload = null, genreController = null;
     let genreRunning = false;
     let genreRevision = 0, genreSummary = null;
+
+    let heardIds = new Set(), onlyUnheard = false, discoveryRevision = 0, discoverySummary = null;
+    const BACKUP_LIMIT = 32 * 1024 * 1024;
+    function restoreDiscovery() {
+      heardIds = new Set([...(Array.isArray(personal.heard) ? personal.heard : []),
+        ...personal.history.map(t => t.id)]);
+      personal.heard = [...heardIds];
+      onlyUnheard = personal.onlyUnheard === true;
+      discoveryRevision++;
+    }
+    function setDiscovery(enabled) {
+      onlyUnheard = !!enabled;
+      personal.onlyUnheard = onlyUnheard;
+      nextPlan = null; visibleTrackLimit = 100;
+      void persistPersonal(); renderUI();
+    }
+    function renderDiscovery() {
+      const key = [memoryRevision, personalEpoch, discoveryRevision, tracks.length].join(':');
+      if (discoverySummary?.key !== key) {
+        const ids = new Set(tracks.map(t => t.id));
+        let heard = 0;
+        for (const id of heardIds) if (ids.has(id)) heard++;
+        discoverySummary = { key, heard, total: ids.size };
+      }
+      const { heard, total } = discoverySummary;
+      const percent = total ? (heard / total * 100).toLocaleString('pt-BR', { maximumFractionDigits: 2 }) : '0';
+      document.getElementById('discovery-progress').textContent =
+        heard.toLocaleString('pt-BR') + ' / ' + total.toLocaleString('pt-BR') + ' faixas ouvidas · ' + percent + '%';
+      document.getElementById('btn-unheard').setAttribute('aria-pressed', String(onlyUnheard));
+      document.getElementById('btn-unheard').disabled = !personalReady;
+      if (onlyUnheard && !getQueue().length) {
+        document.getElementById('next-track-title').textContent = 'Nenhuma faixa inédita nesta seleção';
+        document.getElementById('next-track-artist').textContent = 'Desative “Somente nunca tocadas” ou escolha outra estação';
+      }
+    }
+    // Export an explicit allowlist. No catalog, audio, access token, account email or Firebase data.
+    function makeBackup() {
+      if (!personalReady) throw Error('Aguarde o carregamento da memória pessoal.');
+      return {
+        format: 'gothic-radio-personal', version: 1, exportedAt: new Date().toISOString(),
+        stations: personal.stations.map(s => ({ id: s.id, name: s.name, ids: [...s.ids] })),
+        favorites: [...favIds], heard: [...heardIds],
+        history: personal.history.map(t => ({ id: t.id, title: t.title, artist: t.artist,
+          streamFileId: t.streamFileId || t.id, playedAt: t.playedAt })),
+      };
+    }
+    function validateBackup(value) {
+      if (!value || value.format !== 'gothic-radio-personal' || value.version !== 1)
+        throw Error('Formato ou versão de backup não compatível.');
+      const id = v => {
+        if (typeof v !== 'string' || !/^[A-Za-z0-9_-]{1,256}$/.test(v)) throw Error('Identificador inválido no backup.');
+        return v;
+      };
+      let references = 0;
+      const ids = list => {
+        if (!Array.isArray(list) || list.length > 500000) throw Error('Lista inválida no backup.');
+        references += list.length;
+        if (references > 1000000) throw Error('Backup excede o limite de referências.');
+        return [...new Set(list.map(id))];
+      };
+      const label = (s, limit) => {
+        if (typeof s !== 'string' || !s.trim() || s.length > limit) throw Error('Texto inválido no backup.');
+        return s;
+      };
+      if (!Array.isArray(value.stations) || value.stations.length > 1000 ||
+          !Array.isArray(value.history) || value.history.length > 200) throw Error('Estrutura de backup inválida.');
+      const stationIds = new Set();
+      const stations = value.stations.map(s => {
+        if (!s || stationIds.has(id(s.id))) throw Error('Estação duplicada no backup.');
+        stationIds.add(s.id);
+        return { id: s.id, name: label(s.name, 80), ids: ids(s.ids) };
+      });
+      const history = value.history.map(t => {
+        if (!t || !Number.isSafeInteger(t.playedAt) || t.playedAt < 0) throw Error('Histórico inválido.');
+        return { id: id(t.id), streamFileId: id(t.streamFileId || t.id),
+          title: label(t.title, 4096), artist: label(t.artist, 4096), playedAt: t.playedAt };
+      });
+      return { stations, history, favorites: ids(value.favorites), heard: ids(value.heard) };
+    }
+    function parseBackup(text) {
+      if (typeof text !== 'string' || text.length > BACKUP_LIMIT) throw Error('Backup muito grande (máximo 32 MB).');
+      let value;
+      try { value = JSON.parse(text); } catch { throw Error('Não foi possível ler este arquivo JSON.'); }
+      return validateBackup(value);
+    }
+    async function importBackup(data, expectedEpoch = personalEpoch) {
+      if (!personalReady || expectedEpoch !== personalEpoch) throw Error('A conta mudou. Abra o backup novamente.');
+      data = validateBackup({ ...data, format: 'gothic-radio-personal', version: 1 });
+      const merged = new Map(personal.stations.map(s => [s.id, { ...s, ids: [...s.ids] }]));
+      for (const incoming of data.stations) {
+        const existing = merged.get(incoming.id);
+        if (existing) existing.ids = [...new Set([...existing.ids, ...incoming.ids])];
+        else merged.set(incoming.id, incoming);
+      }
+      const history = new Map();
+      for (const t of [...personal.history, ...data.history]) history.set(t.id + ':' + t.playedAt, t);
+      personal.stations = [...merged.values()];
+      personal.history = [...history.values()].sort((a, b) => b.playedAt - a.playedAt).slice(0, 200);
+      favIds = new Set([...favIds, ...data.favorites]);
+      heardIds = new Set([...heardIds, ...data.heard, ...data.history.map(t => t.id)]);
+      personal.heard = [...heardIds];
+      discoveryRevision++;
+      // Preserve current station queue, transport, volume and shuffle.
+      renderUI();
+      await persistPersonal();
+      if (expectedEpoch !== personalEpoch) throw Error('Backup salvo na conta anterior; a conta ativa mudou.');
+    }
+    function exportBackup() {
+      const dialog = document.getElementById('settings-dialog');
+      try {
+        const json = JSON.stringify(makeBackup());
+        if (new Blob([json]).size > BACKUP_LIMIT) throw Error('Backup excede o limite de 32 MB.');
+        const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+        const link = node('a', undefined, dialog);
+        link.href = url; link.download = 'gothic-radio-backup-' + new Date().toISOString().slice(0, 10) + '.json';
+        link.click(); link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 30000);
+        document.getElementById('backup-status').textContent = 'Arquivo preparado. Guarde-o em Arquivos ou outro local seguro.';
+      } catch (error) { document.getElementById('backup-status').textContent = error.message; }
+    }
+    async function previewBackup(file) {
+      const status = document.getElementById('backup-status');
+      const preview = document.getElementById('backup-preview');
+      preview.innerHTML = '';
+      const epoch = personalEpoch;
+      const ticket = ++backupPreviewTicket;
+      if (!file) return;
+      try {
+        if (file.size > BACKUP_LIMIT) throw Error('Arquivo muito grande (máximo 32 MB).');
+        const data = parseBackup(await file.text());
+        if (ticket !== backupPreviewTicket || epoch !== personalEpoch) return;
+        node('p', data.stations.length + ' estações · ' + data.favorites.length + ' favoritas · ' +
+          data.heard.length + ' faixas ouvidas. Adicionar aos dados da conta atual?', preview);
+        node('p', 'Nada será apagado. Estações com o mesmo identificador serão combinadas; nomes atuais serão mantidos.', preview);
+        const button = action('Confirmar importação', async () => {
+          button.disabled = true;
+          try {
+            await importBackup(data, epoch);
+            preview.innerHTML = ''; status.textContent = 'Backup importado e salvo neste aparelho.';
+          } catch (error) {
+            status.textContent = 'Importação não confirmada: ' + error.message + ' Exporte uma cópia antes de fechar se o armazenamento falhou.';
+            button.disabled = false;
+          }
+        }, preview);
+        action('Cancelar', () => { backupPreviewTicket++; preview.innerHTML = ''; status.textContent = ''; }, preview);
+        status.textContent = '';
+      } catch (error) {
+        if (ticket === backupPreviewTicket) status.textContent = error.message;
+      }
+    }
+    let backupPreviewTicket = 0;
+
     const PREFETCH_LIMIT = 32 * 1024 * 1024;
     const personalKey = () => 'personal-v1:' + personalOwner;
     async function personalTransaction(mode, action) {
@@ -167,6 +330,7 @@
           personal.genres ||= {};
           favIds = new Set(data.favorites || []);
         }
+        restoreDiscovery();
         personalReady = true;
         renderUI();
       } catch {
@@ -176,6 +340,9 @@
     async function changePersonalAccount(email) {
       const owner = email.trim().toLowerCase() || 'guest';
       if (owner === personalOwner) return;
+      backupPreviewTicket++;
+      document.getElementById('backup-preview').innerHTML = '';
+      document.getElementById('backup-status').textContent = '';
       ++playbackRequest;
       audio.pause();
       if (audio.src.startsWith('blob:')) URL.revokeObjectURL(audio.src);
@@ -196,7 +363,7 @@
       memoryRevision++;
       tracks = []; currentTrack = null; savedPlayback = {}; restoreTrackTime = false;
       personal = { stations: [], history: [], genres: {}, favorites: [] };
-      favIds = new Set();
+      favIds = new Set(); heardIds = new Set(); onlyUnheard = false; discoveryRevision++;
       await restorePersonal();
       await loadPublishedCatalog();
     }
@@ -770,6 +937,7 @@
 
     function getQueue() {
       return tracks.filter(t => {
+        if (onlyUnheard && heardIds.has(t.id)) return false;
         if (!stationAllows(t)) return false;
         if (onlyFavs && !favIds.has(t.id)) return false;
         if (selectedArtist !== 'ALL' && t.artist !== selectedArtist) return false;
@@ -815,7 +983,7 @@
 
     function getNextTrack(q = getQueue()) {
       if (!q.length) { nextPlan = null; return null; }
-      const key = JSON.stringify([currentTrack?.id, isShuffle, onlyFavs, selectedArtist, searchQuery, memoryRevision, selectedStation, q.length]);
+      const key = JSON.stringify([currentTrack?.id, isShuffle, onlyFavs, selectedArtist, searchQuery, memoryRevision, selectedStation, onlyUnheard, q.length]);
       if (nextPlan?.key === key) {
         const planned = q.find(t => t.id === nextPlan.id);
         if (planned) return planned;
@@ -853,7 +1021,7 @@
     }
 
     async function resumePlayback() {
-      if (!audio.src || loadedTrackId !== currentTrack?.id) return playTrack(currentTrack || tracks[0]);
+      if (!audio.src || loadedTrackId !== currentTrack?.id) return playTrack((!onlyUnheard || (currentTrack && !heardIds.has(currentTrack.id))) ? (currentTrack || getQueue()[0]) : getQueue()[0]);
       try { await audio.play(); } catch { showStatus('Toque em Play na rádio para continuar.'); }
     }
 
@@ -965,6 +1133,7 @@
       }
 
       renderPersonalUI();
+      renderDiscovery();
     }
 
     document.getElementById('brand-reset').onclick = () => selectStation('all');
@@ -983,6 +1152,16 @@
     document.getElementById('btn-prev').onclick = prevTrack;
     document.getElementById('btn-shuffle').onclick = () => { isShuffle = !isShuffle; renderUI(); };
     document.getElementById('btn-only-favs').onclick = () => selectStation(onlyFavs ? 'all' : 'favorites');
+    document.getElementById('btn-settings').onclick = () => document.getElementById('settings-dialog').showModal();
+    document.getElementById('btn-close-settings').onclick = () => {
+      backupPreviewTicket++; document.getElementById('backup-preview').innerHTML = '';
+      document.getElementById('settings-dialog').close();
+    };
+    document.getElementById('btn-export-backup').onclick = exportBackup;
+    document.getElementById('backup-file').onchange = e => {
+      void previewBackup(e.target.files?.[0]); e.target.value = '';
+    };
+    document.getElementById('btn-unheard').onclick = () => setDiscovery(!onlyUnheard);
     document.getElementById('btn-fav-current').onclick = () => toggleFavorite(currentTrack);
     document.getElementById('btn-station-current').onclick = () => openStationMenu(currentTrack);
     document.getElementById('station-select').onchange = e => selectStation(e.target.value);
@@ -994,10 +1173,12 @@
     audio.onplaying = () => {
       if (!personalReady || loadedTrackId !== currentTrack?.id || historyRecorded === playbackRequest) return;
       historyRecorded = playbackRequest;
+      heardIds.add(currentTrack.id); personal.heard = [...heardIds]; discoveryRevision++;
       personal.history.unshift({ id: currentTrack.id, streamFileId: currentTrack.streamFileId,
         title: currentTrack.title, artist: currentTrack.artist, playedAt: Date.now() });
       personal.history = personal.history.slice(0, 200);
       void persistPersonal();
+      renderUI();
     };
     document.getElementById('seek-slider').oninput = (e) => {
       audio.currentTime = Number(e.target.value || 0);
