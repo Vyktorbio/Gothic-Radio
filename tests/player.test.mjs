@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
-import { IDBFactory } from 'fake-indexeddb';
+import { IDBFactory, IDBKeyRange } from 'fake-indexeddb';
 
 const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 const script = html.match(/<script>\s*([\s\S]*?)<\/script>/)[1];
@@ -24,7 +24,7 @@ function boot({ db = new IDBFactory(), values = new Map(), full = false, navigat
   const localStorage = { getItem: k => values.get(k) ?? null, removeItem: k => values.delete(k),
     setItem(k, v) { if (full) throw Error('QuotaExceededError'); values.set(k, v); } };
   const window = { indexedDB: db, addEventListener: (name, fn) => events.set(name, fn), open: () => popup };
-  const ctx = vm.createContext({ window, document, localStorage, indexedDB: db, navigator, MediaMetadata: class { constructor(data) { Object.assign(this, data); } }, console,
+  const ctx = vm.createContext({ window, document, localStorage, indexedDB: db, IDBKeyRange, navigator, MediaMetadata: class { constructor(data) { Object.assign(this, data); } }, console,
     setTimeout, clearTimeout, fetch, URL, Response, Blob, structuredClone, AbortController, TextDecoder, crypto: { randomUUID: () => 'station-' + Math.floor(Math.random() * 1000000000) } });
   vm.runInContext(script, ctx);
   return { ctx, db, values, nodes, events, popup, run: code => vm.runInContext(code, ctx) };
@@ -536,4 +536,178 @@ test('backup disk failure is reported without deleting existing selections', asy
   await assert.rejects(app.run("importBackup({ ...makeBackup(), favorites:['b'] })"), /Quota/);
   assert.equal(app.run('personal.stations[0].name'), 'Keep');
   assert.equal(app.run('tracks.length'), 3);
+});
+
+
+function genreFixture(fetch) {
+  const app = playerFixture({}, fetch || (async () => new Response(new Uint8Array([1,2,3]), { status:206 })));
+  app.run('genreWait = async () => {}');
+  return app;
+}
+
+test('automatic genre reader continues past 50 and saves each result outside personal snapshots', async () => {
+  let requests = 0;
+  const app = genreFixture(async () => { requests++; return new Response(new Uint8Array([1]), { status:206 }); });
+  await app.run('musicReady');
+  app.run("tracks = Array.from({length: 55}, (_,i) => ({id:'genre-'+i,title:'Track',artist:'Artist'})); memoryRevision++");
+  await app.run('indexGenres()');
+  assert.equal(requests, 55);
+  assert.equal(app.run('Object.keys(personal.genres).length'), 55);
+  assert.equal(app.run('personal.genreAuto'), false);
+  const saved = await app.run("personalTransaction('readonly', store => store.get(personalKey()))");
+  assert.equal(saved.genres, undefined);
+  assert.equal(saved.genreStorage, 1);
+  assert.equal(app.run('genreRunning'), false);
+});
+
+test('manual pause aborts the pending request and restarting skips saved genres', async () => {
+  let calls = 0, app, pause = true;
+  app = genreFixture(async (_url, options) => {
+    calls++;
+    if (calls === 2 && pause) {
+      await app.run('indexGenres()');
+      assert.equal(options.signal.aborted, true);
+    }
+    return new Response(new Uint8Array([1]), {status:206});
+  });
+  await app.run('musicReady');
+  await app.run('indexGenres()');
+  assert.equal(app.run('Object.keys(personal.genres).length'), 1);
+  pause = false;
+  await app.run('indexGenres()');
+  assert.equal(calls, 4);
+  assert.equal(app.run('Object.keys(personal.genres).length'), 3);
+});
+
+test('rate limits and temporary server failures retry the same file with Retry-After', async () => {
+  const urls = [], delays = [];
+  const app = genreFixture(async url => {
+    urls.push(url);
+    if (urls.length === 1) return new Response('{}', {status:429, headers:{'Retry-After':'7'}});
+    if (urls.length === 2) return new Response('{}', {status:503});
+    return new Response(new Uint8Array([1]), {status:206});
+  });
+  app.ctx.delays = delays;
+  app.run('genreWait = async ms => { delays.push(ms); }');
+  await app.run('musicReady');
+  await app.run('indexGenres()');
+  assert.equal(urls[0], urls[1]);
+  assert.equal(urls[1], urls[2]);
+  assert.ok(delays[0] >= 7000);
+  assert.ok(delays[1] >= 4000);
+  assert.equal(app.run('Object.keys(personal.genres).length'), 3);
+});
+
+test('expired access never opens a popup and resumes after sign-in', async () => {
+  let calls = 0;
+  const app = genreFixture(async () => {
+    if (++calls === 1) return new Response('{}', {status:401});
+    return new Response(new Uint8Array([1]), {status:206});
+  });
+  await app.run('musicReady');
+  app.ctx.window.gothicRadioSignIn = () => { throw Error('No background login'); };
+  await app.run('indexGenres()');
+  assert.equal(app.run('personal.genreAuto'), true);
+  assert.equal(app.run('genreRunning'), false);
+  assert.equal(app.run('accessToken'), null);
+  await app.run("saveToken('new-test-token', '')");
+  await app.run('genreTask');
+  assert.equal(app.run('Object.keys(personal.genres).length'), 3);
+});
+
+test('automatic preference and per-track progress survive reload and skip completed files', async () => {
+  const app = genreFixture();
+  await app.run('musicReady');
+  app.run("personal.genreAuto = true");
+  await app.run("personalTransaction('readwrite', store => store.put({id:'a',result:{values:['ebm'],status:'tagged'}},genrePrefix(personalOwner)+'a'))");
+  await app.run('persistPersonal()');
+  const requested = [];
+  const reopened = boot({db:app.db, values:app.values, fetch:async url => {
+    requested.push(url);
+    return new Response(new Uint8Array([1]), {status:206});
+  }});
+  reopened.run('genreWait = async () => {}');
+  await reopened.run('musicReady');
+  await reopened.run('genreTask');
+  assert.equal(requested.length, 2);
+  assert.ok(requested.every(url => !url.includes('/a?')));
+  assert.equal(reopened.run("personal.genres.a.values[0]"), 'ebm');
+});
+
+test('genre reader waits for audio, hidden page, offline and save-data', async () => {
+  const app = genreFixture();
+  await app.run('musicReady');
+  app.run("activeDownload = {settled:false}; document.hidden=true; navigator.onLine=false; navigator.connection={saveData:true}");
+  let waits = 0;
+  app.ctx.release = () => {
+    waits++;
+    app.run('activeDownload.settled=true; document.hidden=false; navigator.onLine=true; navigator.connection.saveData=false');
+  };
+  app.run('genreWait = async () => release()');
+  await app.run('indexGenres()');
+  assert.ok(waits >= 1);
+  assert.equal(app.run('Object.keys(personal.genres).length'), 3);
+});
+
+test('legacy embedded genre results migrate without losing data', async () => {
+  const app = genreFixture();
+  await app.run('musicReady');
+  await app.run("personalTransaction('readwrite', store => store.put({stations:[],history:[],favorites:[],genres:{a:{values:['ebm'],status:'tagged'}}},personalKey()))");
+  const reopened = boot({db:app.db,values:app.values});
+  await reopened.run('musicReady');
+  assert.equal(reopened.run('personal.genres.a.values[0]'), 'ebm');
+  await reopened.run('persistPersonal()');
+  const again = boot({db:app.db,values:app.values});
+  await again.run('musicReady');
+  assert.equal(again.run('personal.genres.a.values[0]'), 'ebm');
+});
+
+test('switching accounts cancels genre work without copying results or auto preference', async () => {
+  let app;
+  app = genreFixture(async () => {
+    app.run('loadPublishedCatalog = async () => {}');
+    await app.run("changePersonalAccount('other@example.invalid')");
+    return new Response(new Uint8Array([1]), {status:206});
+  });
+  await app.run('musicReady');
+  await app.run('indexGenres()');
+  assert.equal(app.run('Object.keys(personal.genres).length'), 0);
+  assert.notEqual(app.run('personal.genreAuto'), true);
+  assert.equal(app.run('genreRunning'), false);
+});
+
+
+test('rapid pause/start waits for the aborted worker then resumes once', async () => {
+  let app, release, calls = 0;
+  app = genreFixture(async () => {
+    calls++;
+    if (calls === 1) await new Promise(resolve => { release = resolve; });
+    return new Response(new Uint8Array([1]), {status:206});
+  });
+  await app.run('musicReady');
+  const first = app.run('indexGenres()');
+  while (!release) await new Promise(resolve => setTimeout(resolve, 0));
+  await app.run('indexGenres()');
+  const restarted = app.run('indexGenres()');
+  release();
+  await first;
+  await restarted;
+  assert.equal(calls, 4);
+  assert.equal(app.run('Object.keys(personal.genres).length'), 3);
+  assert.equal(app.run('genreRunning'), false);
+});
+
+test('network interruption retries and per-file denial does not block remaining files', async () => {
+  let calls = 0;
+  const app = genreFixture(async () => {
+    calls++;
+    if (calls === 1) throw Error('network');
+    if (calls === 2) return new Response(JSON.stringify({error:{errors:[{reason:'insufficientFilePermissions'}]}}), {status:403});
+    return new Response(new Uint8Array([1]), {status:206});
+  });
+  await app.run('musicReady');
+  await app.run('indexGenres()');
+  assert.equal(calls, 4);
+  assert.equal(app.run('personal.genres.a.status'), 'inaccessible');
+  assert.equal(app.run('Object.keys(personal.genres).length'), 3);
 });

@@ -69,8 +69,8 @@
     <p>O progresso conta faixas que começaram a tocar desde o registro no aparelho, incluindo o histórico disponível. Reproduções antigas fora desse registro são desconhecidas.</p>
         <p>Estações, favoritas e histórico ficam apenas neste aparelho, separados por conta. Não há sincronização.</p>
         <details><summary>Gêneros das músicas</summary><p id="genre-coverage"></p>
-          <p>Leitura parcial de tags MP3 e FLAC. Outros formatos e tags extensas podem ficar sem classificação. Cada lote lê até 3,2 MB.</p>
-          <button id="btn-index-genres">Ler gêneros (lote de 50)</button>
+          <p>Leitura parcial de tags MP3 e FLAC. Outros formatos e tags extensas podem ficar sem classificação. A leitura automática continua enquanto a rádio estiver visível, com até 64 KB por faixa. O acervo completo pode consumir vários GB; prefira Wi-Fi. Você pode pausar a qualquer momento.</p>
+          <button id="btn-index-genres">Iniciar leitura automática</button><p id="genre-state" role="status" aria-live="polite"></p><p>O progresso fica salvo. Ao reabrir, a leitura retoma se estiver ativada e houver acesso válido. No iPhone, fechar ou bloquear a tela pode suspender a leitura.</p>
         </details>
   </dialog>
   <span id="vfd-clock" hidden></span>
@@ -313,7 +313,8 @@
     function persistPersonal() {
       const key = personalKey();
       personal.favorites = [...favIds];
-      const snapshot = structuredClone(personal);
+      const { genres, ...personalData } = personal;
+      const snapshot = structuredClone({ ...personalData, genreStorage: 1 });
       personalWrites = personalWrites.catch(() => {}).then(() =>
         personalTransaction('readwrite', store => store.put(snapshot, key)));
       personalWrites.catch(() => showStatus('Não foi possível salvar suas estações e histórico neste aparelho.'));
@@ -330,6 +331,11 @@
           personal.genres ||= {};
           favIds = new Set(data.favorites || []);
         }
+        const owner = personalOwner;
+        const genres = await restoreGenreMemory(owner, data?.genreStorage === 1 ? {} : personal.genres);
+        if (epoch !== personalEpoch) return;
+        personal.genres = genres;
+        genreRevision++; genreSummary = null;
         restoreDiscovery();
         personalReady = true;
         renderUI();
@@ -350,7 +356,7 @@
       loadedTrackId = null;
       prefetchJob?.controller.abort(); prefetchJob = null;
       activeDownload?.controller.abort(); activeDownload = null;
-      genreController?.abort(); genreRunning = false;
+      genreController?.abort(); genreController = null; genreTask = null; genreRunning = false; genreMessage = '';
       playbackHistory = [];
       historyRecorded = -1;
       selectedStation = 'all'; stationQueueIds = null; historyView = false; nextPlan = null;
@@ -468,7 +474,7 @@
       document.getElementById('genre-coverage').textContent =
         'Gêneros: ' + tagged.toLocaleString('pt-BR') + ' faixas classificadas · ' + checked.toLocaleString('pt-BR') + ' / ' +
         tracks.length.toLocaleString('pt-BR') + ' examinadas. Cobertura parcial.';
-      document.getElementById('btn-index-genres').textContent = genreRunning ? 'Pausar leitura de gêneros' : 'Ler gêneros (lote de 50)';
+      updateGenreControls();
       document.getElementById('btn-manage-station').disabled = !selectedStation.startsWith('personal:');
       if (historyView) {
         const list = document.getElementById('tracks-list'); list.innerHTML = '';
@@ -533,7 +539,7 @@
     function makeAudioJob(track, background) {
       const controller = new AbortController();
       const owner = personalOwner;
-      const job = { id: track.id, controller, owner, background, promise: null };
+      const job = { id: track.id, controller, owner, background, promise: null, settled: false };
       job.promise = (async () => {
         const tok = await ensureValidToken(false);
         if (!tok || controller.signal.aborted) throw Error('Login required');
@@ -547,7 +553,7 @@
         if (owner !== personalOwner || controller.signal.aborted) throw Error('Obsolete audio');
         return blob;
       })();
-      job.promise.catch(() => {});
+      job.promise.then(() => { job.settled = true; }, () => { job.settled = true; });
       return job;
     }
     function prepareNext(track) {
@@ -640,38 +646,169 @@
       const normalized = normalizeGenres(values);
       return { values: normalized, status: normalized.length ? 'tagged' : status };
     }
+
+    let genreMessage = '', genreTask = null;
+    const genrePrefix = owner => 'genre-v1:' + encodeURIComponent(owner) + ':';
+    async function restoreGenreMemory(owner, legacy) {
+      const prefix = genrePrefix(owner);
+      // Move old embedded results once, before personal snapshots stop containing them.
+      if (Object.keys(legacy).length) await personalTransaction('readwrite', store => {
+        for (const [id, result] of Object.entries(legacy)) store.put({ id, result }, prefix + id);
+      });
+      const rows = await personalTransaction('readonly', store =>
+        store.getAll(IDBKeyRange.bound(prefix, prefix + '\uffff')));
+      const results = {};
+      for (const row of rows || []) results[row.id] = row.result;
+      return results;
+    }
+    function genreWait(ms, signal) {
+      return new Promise(resolve => {
+        if (signal.aborted) return resolve();
+        const finish = () => { clearTimeout(timer); signal.removeEventListener('abort', finish); resolve(); };
+        const timer = setTimeout(finish, ms);
+        signal.addEventListener('abort', finish, { once: true });
+      });
+    }
+    function genreBackoff(attempt, retryAfter) {
+      const header = retryAfter == null ? 0 :
+        (/^\d+(\.\d+)?$/.test(retryAfter) ? Number(retryAfter) * 1000 : Date.parse(retryAfter) - Date.now());
+      return Math.max(Math.min(60000, 2000 * 2 ** Math.min(attempt, 5)), Number.isFinite(header) ? Math.max(0, header) : 0);
+    }
+    function updateGenreControls() {
+      document.getElementById('btn-index-genres').textContent = personal.genreAuto
+        ? 'Pausar leitura automática' : 'Iniciar leitura automática';
+      document.getElementById('genre-state').textContent = genreMessage;
+    }
     async function indexGenres() {
-      if (genreRunning) { genreController?.abort(); genreController = null; genreRunning = false; renderUI(); return; }
       if (!personalReady) return;
-      const tok = await ensureValidToken(false);
-      if (!tok) { showStatus('Toque em Entrar antes de ler gêneros.'); return; }
+      if (personal.genreAuto) {
+        personal.genreAuto = false;
+        genreController?.abort();
+        genreMessage = 'Pausado. Progresso salvo.';
+        updateGenreControls();
+        await persistPersonal();
+        return;
+      }
+      personal.genreAuto = true;
+      try { await persistPersonal(); }
+      catch { personal.genreAuto = false; genreMessage = 'Não foi possível salvar. Verifique o espaço disponível.'; updateGenreControls(); return; }
+      return resumeGenreIndexing();
+    }
+    function resumeGenreIndexing() {
+      if (genreTask) return genreController?.signal.aborted
+        ? genreTask.then(() => resumeGenreIndexing()) : genreTask;
+      if (!personalReady || !personal.genreAuto || !tracks.length) return Promise.resolve();
+      const task = runGenreIndexing();
+      genreTask = task;
+      task.finally(() => { if (genreTask === task) genreTask = null; }).catch(() => {});
+      return task;
+    }
+    async function runGenreIndexing() {
+      const owner = personalOwner, epoch = personalEpoch;
+      const controller = new AbortController(); genreController = controller;
+      const signal = controller.signal;
       genreRunning = true;
-      const epoch = personalEpoch, controller = new AbortController(); genreController = controller;
-      const pending = tracks.filter(t => !personal.genres[t.id] && !normalizeGenres(t.genres || t.genre || []).length).slice(0, 50);
+      let queue = tracks, revision = memoryRevision, cursor = 0, failures = 0, lastRender = 0;
+      const valid = () => !signal.aborted && epoch === personalEpoch && owner === personalOwner && personal.genreAuto;
       try {
-        for (const track of pending) {
-          if (controller.signal.aborted || epoch !== personalEpoch) break;
-          const res = await fetch('https://www.googleapis.com/drive/v3/files/' +
-            encodeURIComponent(track.streamFileId || track.id) + '?alt=media&supportsAllDrives=true', {
-              headers: { Authorization: 'Bearer ' + tok, Range: 'bytes=0-65535' }, signal: controller.signal
-            });
-          if (res.status !== 206) {
-            await res.body?.cancel();
-            throw Error('Partial reads unavailable or access/rate limit');
+        while (valid()) {
+          if (revision !== memoryRevision) { queue = tracks; cursor = 0; revision = memoryRevision; }
+          while (cursor < queue.length && (personal.genres[queue[cursor].id] ||
+            normalizeGenres(queue[cursor].genres || queue[cursor].genre || []).length)) cursor++;
+          if (cursor >= queue.length) {
+            personal.genreAuto = false;
+            genreMessage = 'Leitura concluída. Tags ausentes ou não suportadas continuam sem classificação.';
+            await persistPersonal();
+            break;
           }
-          const blob = await readBoundedResponse(res, 65536, controller);
-          const result = parsePartialGenres(new Uint8Array(await blob.arrayBuffer()));
-          if (controller.signal.aborted || epoch !== personalEpoch) break;
+          if (document.hidden || navigator.onLine === false || navigator.connection?.saveData ||
+              (activeDownload && !activeDownload.settled) || (prefetchJob && !prefetchJob.settled)) {
+            genreMessage = navigator.onLine === false ? 'Aguardando conexão…' :
+              navigator.connection?.saveData ? 'Aguardando desativar a economia de dados…' :
+              document.hidden ? 'Aguardando a rádio ficar visível…' : 'Aguardando o áudio carregar…';
+            updateGenreControls();
+            await genreWait(1000, signal);
+            continue;
+          }
+          const token = await ensureValidToken(false);
+          if (!valid()) break;
+          if (!token) {
+            genreMessage = 'Aguardando login. Toque em Entrar; a leitura retomará depois.';
+            break;
+          }
+          const track = queue[cursor];
+          genreMessage = 'Lendo automaticamente. Você pode continuar ouvindo.';
+          updateGenreControls();
+          const request = new AbortController();
+          const abort = () => request.abort();
+          signal.addEventListener('abort', abort, { once: true });
+          const timer = setTimeout(() => request.abort(), 20000);
+          let result = null, wait = 0;
+          try {
+            const res = await fetch('https://www.googleapis.com/drive/v3/files/' +
+              encodeURIComponent(track.streamFileId || track.id) + '?alt=media&supportsAllDrives=true', {
+                headers: { Authorization: 'Bearer ' + token, Range: 'bytes=0-65535' }, signal: request.signal
+              });
+            if (res.status === 401) {
+              await res.body?.cancel();
+              accessToken = null; tokenExpiresAt = 0;
+              genreMessage = 'Acesso expirado. Toque em Entrar para retomar a leitura.';
+              break;
+            }
+            if (res.status === 429 || res.status >= 500) {
+              wait = genreBackoff(failures++, res.headers.get('retry-after')); await res.body?.cancel();
+            } else if (res.status === 403) {
+              const error = await res.json().catch(() => ({}));
+              const quota = error.error?.errors?.some(e => /rateLimit|quota/i.test(e.reason || ''));
+              if (quota) wait = genreBackoff(failures++, res.headers.get('retry-after'));
+              else result = { values: [], status: 'inaccessible' };
+            } else if (res.status === 404 || res.status === 410 || res.status === 416) {
+              await res.body?.cancel(); result = { values: [], status: 'unavailable' };
+            } else if (res.status !== 206) {
+              await res.body?.cancel();
+              personal.genreAuto = false;
+              genreMessage = 'Leitura pausada: o servidor não forneceu o trecho solicitado. Progresso salvo.';
+              await persistPersonal();
+              break;
+            } else {
+              const blob = await readBoundedResponse(res, 65536, request);
+              result = parsePartialGenres(new Uint8Array(await blob.arrayBuffer()));
+            }
+          } catch {
+            if (!valid()) break;
+            wait = genreBackoff(failures++);
+          } finally {
+            clearTimeout(timer); signal.removeEventListener('abort', abort);
+          }
+          if (!valid()) break;
+          if (wait) {
+            genreMessage = 'Aguardando para tentar novamente (' + Math.ceil(wait / 1000) + ' s). Progresso salvo.';
+            updateGenreControls(); await genreWait(wait, signal); continue;
+          }
+          // Commit only this result, not an ever-growing copy of 140,000 results.
+          await personalTransaction('readwrite', store => store.put({ id: track.id, result }, genrePrefix(owner) + track.id));
+          if (!valid()) break;
+          const previousKey = [memoryRevision, personalEpoch, genreRevision, tracks.length].join(':');
           personal.genres[track.id] = result;
           genreRevision++;
-          await persistPersonal();
-          renderUI();
-          await new Promise(resolve => setTimeout(resolve, 500));
+          if (genreSummary?.key === previousKey) {
+            genreSummary.checked++;
+            if (result.values.length) genreSummary.tagged++;
+            result.values.forEach(g => genreSummary.genres.add(g));
+            genreSummary.key = [memoryRevision, personalEpoch, genreRevision, tracks.length].join(':');
+          }
+          failures = 0; cursor++;
+          if (Date.now() - lastRender >= 3000) { renderUI(); lastRender = Date.now(); }
+          await genreWait(500, signal);
         }
       } catch {
-        if (!controller.signal.aborted) showStatus('Leitura de gêneros pausada. Verifique o acesso ou tente mais tarde; o progresso foi mantido.');
+        if (valid()) {
+          personal.genreAuto = false;
+          genreMessage = 'Leitura pausada: não foi possível salvar o progresso neste aparelho.';
+          await persistPersonal().catch(() => {});
+        }
       } finally {
-        if (epoch === personalEpoch && genreController === controller) { genreRunning = false; renderUI(); }
+        if (genreController === controller) { genreRunning = false; updateGenreControls(); renderUI(); }
       }
     }
 
@@ -776,6 +913,7 @@
       } catch (e) {}
       showStatus('');
       renderUI();
+      void resumeGenreIndexing();
     }
 
     function fmtTime(sec) {
@@ -1262,6 +1400,12 @@
     }
     const personalLoaded = restorePersonal();
     const musicReady = Promise.all([loadPublishedCatalog(), personalLoaded]);
+    musicReady.then(() => { void resumeGenreIndexing(); });
+    window.addEventListener('online', () => { void resumeGenreIndexing(); });
+    window.addEventListener('pageshow', () => { void resumeGenreIndexing(); });
+    window.addEventListener('pagehide', () => {
+      genreController?.abort(); genreController = null; genreTask = null; genreRunning = false;
+    });
   </script>
   <script type="module" src="/src/player-install.tsx"></script>
 </body>
