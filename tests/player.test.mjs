@@ -595,6 +595,7 @@ test('rate limits and temporary server failures retry the same file with Retry-A
   assert.equal(urls[1], urls[2]);
   assert.ok(delays[0] >= 7000);
   assert.ok(delays[1] >= 4000);
+  assert.equal(delays.length, 2, 'Only transient failures should delay indexing');
   assert.equal(app.run('Object.keys(personal.genres).length'), 3);
 });
 
