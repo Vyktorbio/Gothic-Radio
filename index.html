@@ -799,7 +799,6 @@
           }
           failures = 0; cursor++;
           if (Date.now() - lastRender >= 3000) { renderUI(); lastRender = Date.now(); }
-          await genreWait(500, signal);
         }
       } catch {
         if (valid()) {
