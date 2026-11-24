@@ -717,8 +717,12 @@
       try {
         while (valid()) {
           if (revision !== memoryRevision) { queue = tracks; cursor = 0; revision = memoryRevision; }
-          while (cursor < queue.length && (personal.genres[queue[cursor].id] ||
-            normalizeGenres(queue[cursor].genres || queue[cursor].genre || []).length)) cursor++;
+          while (cursor < queue.length) {
+            const track = queue[cursor], entry = personal.genres[track.id];
+            if ((!entry || (entry.status === 'partial' && entry.readerVersion !== 2)) &&
+                !normalizeGenres(track.genres || track.genre || []).length) break;
+            cursor++;
+          }
           if (cursor >= queue.length) {
             personal.genreAuto = false;
             genreMessage = 'Leitura concluída. Tags ausentes ou não suportadas continuam sem classificação.';
@@ -789,6 +793,8 @@
             genreMessage = 'Aguardando para tentar novamente (' + Math.ceil(wait / 1000) + ' s). Progresso salvo.';
             updateGenreControls(); await genreWait(wait, signal); continue;
           }
+          result.readerVersion = 2;
+          const alreadyChecked = !!personal.genres[track.id];
           // Commit only this result, not an ever-growing copy of 140,000 results.
           await personalTransaction('readwrite', store => store.put({ id: track.id, result }, genrePrefix(owner) + track.id));
           if (!valid()) break;
@@ -796,7 +802,7 @@
           personal.genres[track.id] = result;
           genreRevision++;
           if (genreSummary?.key === previousKey) {
-            genreSummary.checked++;
+            if (!alreadyChecked) genreSummary.checked++;
             if (result.values.length) genreSummary.tagged++;
             result.values.forEach(g => genreSummary.genres.add(g));
             genreSummary.key = [memoryRevision, personalEpoch, genreRevision, tracks.length].join(':');
