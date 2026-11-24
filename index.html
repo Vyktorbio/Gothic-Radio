@@ -547,7 +547,11 @@
           encodeURIComponent(track.streamFileId || track.id) + '?alt=media&supportsAllDrives=true', {
             headers: { Authorization: 'Bearer ' + tok }, signal: controller.signal
           });
-        if (!res.ok) { controller.abort(); throw Error('Audio ' + res.status); }
+        if (!res.ok) {
+          controller.abort();
+          if (res.status === 401 && tok === accessToken) invalidateDriveToken();
+          throw Error('Audio ' + res.status);
+        }
         // One speculative track only. Never write speculative audio to persistent cache.
         const blob = background ? await readBoundedResponse(res, PREFETCH_LIMIT, controller) : await res.blob();
         if (owner !== personalOwner || controller.signal.aborted) throw Error('Obsolete audio');
@@ -599,13 +603,13 @@
       let status = 'unsupported';
       if (ascii(0, 3) === 'ID3' && bytes.length >= 10 && [3,4].includes(bytes[3])) {
         const end = 10 + sync(6);
-        if (end > bytes.length || (bytes[5] & 0xc0)) return { values: [], status: 'partial' };
-        status = 'empty';
-        for (let p = 10; p + 10 <= end;) {
+        if (bytes[5] & 0xc0) return { values: [], status: 'partial' };
+        status = end > bytes.length ? 'partial' : 'empty';
+        for (let p = 10; p + 10 <= Math.min(end, bytes.length);) {
           const id = ascii(p, 4);
           if (!bytes[p]) break;
           const size = bytes[3] === 4 ? sync(p+4) : view.getUint32(p+4);
-          if (!size || p + 10 + size > end) return { values: [], status: 'partial' };
+          if (!size || p + 10 + size > Math.min(end, bytes.length)) { status = 'partial'; break; }
           if (id === 'TCON' && bytes[p+8] === 0 && bytes[p+9] === 0) {
             const enc = bytes[p+10];
             if (enc <= 3) {
@@ -751,7 +755,7 @@
               });
             if (res.status === 401) {
               await res.body?.cancel();
-              accessToken = null; tokenExpiresAt = 0;
+              if (token === accessToken) invalidateDriveToken();
               genreMessage = 'Acesso expirado. Toque em Entrar para retomar a leitura.';
               break;
             }
@@ -936,8 +940,13 @@
       return false;
     }
 
-    async function ensureValidToken(interactive = false) {
-      if (accessToken && Date.now() < tokenExpiresAt - 60000) return accessToken;
+    function invalidateDriveToken() {
+      accessToken = null; tokenExpiresAt = 0;
+      try { storage.setItem('gothic_radio_drive_token_exp_v1', '0'); } catch {}
+      document.getElementById('btn-connect').textContent = 'Entrar';
+    }
+    async function ensureValidToken(interactive = false, renew = false) {
+      if (!renew && accessToken && Date.now() < tokenExpiresAt - 60000) return accessToken;
       if (!interactive) return null;
       if (pendingAuthPromise) return pendingAuthPromise;
       if (typeof window.gothicRadioSignIn !== 'function') {
@@ -1113,7 +1122,16 @@
       } catch (e) {
         if (request !== playbackRequest) return;
         isPlaying = false;
-        showStatus('ENTRE PARA CONTINUAR OUVINDO');
+        const messages = {
+          'Audio 401': 'O acesso expirou. Toque em Entrar e depois em Play.',
+          'Login required': 'Toque em Entrar para liberar o áudio.',
+          'Audio 403': 'O Drive recusou o acesso a esta faixa. Tente outra música.',
+          'Audio 404': 'Esta faixa não foi encontrada no Drive. Tente a próxima.'
+        };
+        showStatus(messages[e.message] || (e.name === 'NotAllowedError'
+          ? 'O navegador pausou o áudio. Toque em Play novamente.'
+          : e.name === 'NotSupportedError' ? 'O navegador não consegue tocar este formato. Tente a próxima faixa.'
+          : 'Falha ao carregar ou tocar a faixa. Tente novamente ou avance para a próxima.'));
         renderUI();
       }
     }
@@ -1224,7 +1242,7 @@
       document.getElementById('btn-play').textContent = isPlaying ? 'Pausar' : 'Play';
       const isFav = currentTrack && favIds.has(currentTrack.id);
       document.getElementById('btn-fav-current').textContent = isFav ? 'Favorita' : 'Favoritar';
-      document.getElementById('btn-connect').textContent = (accessToken && Date.now() < tokenExpiresAt) ? 'Conectado' : 'Entrar';
+      document.getElementById('btn-connect').textContent = (accessToken && Date.now() < tokenExpiresAt - 60000) ? 'Reconectar' : 'Entrar';
 
       // Artist filter chips inside drawer
       const artists = ['ALL', ...Array.from(new Set(tracks.map(t => t.artist))).sort()];
@@ -1251,7 +1269,8 @@
         title.textContent = t.title;
         const artist = document.createElement('div');
         artist.className = 'track-row-artist';
-        artist.textContent = t.artist;
+        const genres = personal.genres[t.id]?.values || normalizeGenres(t.genres || t.genre || []);
+        artist.textContent = [t.artist, ...genres].join(' · ');
         text.append(title, artist);
         const play = document.createElement('button');
         play.type = 'button'; play.className = 'track-play'; play.append(text);
@@ -1276,7 +1295,7 @@
 
     document.getElementById('brand-reset').onclick = () => selectStation('all');
     document.getElementById('btn-connect').onclick = async () => {
-      const tok = await ensureValidToken(true);
+      const tok = await ensureValidToken(true, true);
       if (tok && tracks.length === 0) scanColecao(true);
       else renderUI();
     };
